@@ -1,0 +1,3892 @@
+# Wave 11 issue backlog
+
+<!-- Generated from docs/WAVE11_BACKLOG.json by scripts/wave_issues.py --markdown. Do not edit by hand. -->
+
+140 issues, 25000 points. `docs/WAVE11_BACKLOG.json` is the source of truth;
+this document exists so the backlog can be read and reviewed before any issue is
+created.
+
+| Complexity |  Issues | Points each |    Points |
+| ---------- | ------: | ----------: | --------: |
+| High       |     110 |         200 |     22000 |
+| Trivial    |      30 |         100 |      3000 |
+| **Total**  | **140** |             | **25000** |
+
+| Area                | Issues |
+| ------------------- | -----: |
+| `area:api`          |     18 |
+| `area:docs`         |     20 |
+| `area:integrations` |     32 |
+| `area:protocol`     |     10 |
+| `area:signers`      |     16 |
+| `area:testing`      |     23 |
+| `area:tooling`      |     21 |
+
+## High — 200 points each (110 issues)
+
+### `area:api`
+
+#### feat(api): persistence interface for the nonce tracker
+
+An interface behind the nonce tracker plus at least one durable implementation,
+so tracked nonces survive a restart.
+
+**Why this matters:** `noncetracker.go` prevents nonce reuse within a process. A
+restart loses that memory, which is exactly when a retry loop replays a stored
+entry, and the host's rejection then arrives after fees are spent. The guard is
+only as good as its durability.
+
+_Acceptance criteria_
+
+- The tracker works behind an interface and the in-memory implementation remains
+  the default.
+- At least one durable implementation is provided and tested.
+- Concurrent use is safe and covered under `-race`.
+- A test proves a nonce recorded before a simulated restart is still refused
+  afterwards.
+
+_Implementation guidance_
+
+- Read `noncetracker.go` for the current semantics; the interface must not
+  quietly change them.
+- Expiry matters: a store that never forgets grows without bound, so document
+  the retention rule.
+- Keep durable backends dependency-light, or put them in their own module as the
+  adapters are.
+
+#### feat(api): preflight an entry against a network's configured limits
+
+Given a network's current settings, report whether an entry would be rejected
+for an expiration beyond `max_live_until_ledger` or for exceeding a protocol
+limit, before it is submitted.
+
+**Why this matters:** The expiration semantics are documented as deliberately
+not hard-coding a cap, because the library cannot know the network's setting
+offline. That is right, but it leaves every caller to discover the limit by
+having a transaction rejected after paying fees.
+
+_Acceptance criteria_
+
+- Given the network settings, an entry is reported as acceptable or not, with
+  the reason.
+- The settings are an input, never fetched or assumed by the library.
+- The inclusive expiration boundary matches the host's documented behaviour
+  exactly.
+- Tests cover an expiration at, one below and one above the limit.
+
+_Implementation guidance_
+
+- The boundary is inclusive: the host rejects only when the current ledger is
+  past the expiration. Cite the host source.
+- Keep this pure; `rpcflow` is where fetching settings belongs if anyone wants
+  that.
+- Do not reintroduce a hard-coded cap, even as a default.
+
+#### feat(api): report which protocol version an entry requires
+
+For a given entry, report the minimum protocol version that can process it,
+derived from its credential arm and invocation types.
+
+**Why this matters:** `protocolmatrix.go` holds the compatibility information,
+but a caller holding an entry cannot ask the direct question: will this network
+accept it? Submitting a CAP-71 entry to a network that predates it fails in a
+way that is hard to read, and the answer is computable offline.
+
+_Acceptance criteria_
+
+- Every credential arm and invocation function type maps to a minimum version.
+- The answer is derived from the entry, including nested delegates, not from a
+  caller hint.
+- An unknown arm or function type is an error rather than an optimistic answer.
+- A test covers each arm and asserts the matrix and this function cannot
+  disagree.
+
+_Implementation guidance_
+
+- Read `protocolmatrix.go` and reuse its data; a second copy of the mapping is
+  the failure to avoid.
+- Fail closed on unknown inputs: guessing a version here produces a confident
+  wrong answer.
+- The consistency test between the matrix and this function is what keeps it
+  true.
+
+#### feat(api): wall-clock estimates for expiration ledgers
+
+Convert between a ledger number and an approximate time, so an expiration can be
+expressed and reported in human terms with its uncertainty.
+
+**Why this matters:** `ExpirationAfter` counts ledgers, but every operator
+reasons in minutes and hours, and the conversion gets done approximately in
+someone's head or hard-coded at five seconds per ledger. Ledger time varies, so
+an estimate presented without error bounds is how signatures end up expiring
+earlier than intended.
+
+_Acceptance criteria_
+
+- Conversion works in both directions and returns an interval rather than a
+  single time.
+- The assumed ledger rate is an explicit input with a documented default and
+  source.
+- The uncertainty is part of the result and is carried into any formatted
+  output.
+- Tests cover a rate change and assert the interval widens with distance.
+
+_Implementation guidance_
+
+- Return a range, not a point: a false-precision timestamp here is actively
+  harmful.
+- Read `ledger.go` for anything that already assumes a rate and make it
+  consistent.
+- Cite the source for the default rate rather than stating it from memory.
+
+#### feat(api): stable fingerprint for an authorization entry
+
+A short, stable identifier for an entry that is independent of its signatures,
+so the same authorization can be tracked across signing stages.
+
+**Why this matters:** `Equal` compares whole encoded entries, so an entry before
+and after signing compares unequal although it authorizes the same thing. Logs,
+audit records and the diff tooling all need a way to say 'this is the same
+authorization, further along', and each currently invents one.
+
+_Acceptance criteria_
+
+- The fingerprint is unchanged by adding or changing signatures and by the
+  expiration write.
+- It changes whenever anything that is signed changes.
+- It is stable across library versions, with a versioned prefix so a future
+  change is visible.
+- Property tests assert both directions of the invariant over generated entries.
+
+_Implementation guidance_
+
+- `canonical.go` already defines a canonical form — build on it rather than
+  defining a second notion of sameness.
+- The precise boundary of what the fingerprint ignores must match what the
+  preimage ignores; derive it from `preimage.go`.
+- Version the output format from the start; an unversioned identifier can never
+  be changed.
+
+#### feat(api): redact an entry for logs and support bundles
+
+Produce a reduced form of an entry that keeps its structure for diagnosis while
+removing signatures and optionally addresses, with the redaction stated in the
+output.
+
+**Why this matters:** Debugging a failed authorization means sending someone an
+entry, and an entry contains signatures and account addresses. People paste the
+whole base64 into issues today because there is no supported alternative, and
+the documentation's advice to be careful with hostile entries does not help the
+person sharing their own.
+
+_Acceptance criteria_
+
+- The redacted form keeps the tree shape, arms and counts needed to diagnose a
+  problem.
+- Signatures are always removed and addresses are removable, with the choices
+  recorded in the output.
+- The redacted form is explicitly not re-signable and cannot be mistaken for an
+  entry.
+- A test asserts no signature bytes survive any redaction level.
+
+_Implementation guidance_
+
+- Make the output obviously not an entry — a different encoding — so nobody
+  tries to submit one.
+- Reuse `Inspect`'s report rather than designing a third description of an
+  entry.
+- State in the docs that a redacted entry can still identify an account if
+  addresses are kept.
+
+#### feat(api): cost model for a delegate plan
+
+Estimate the signing work, signature count and resource-fee impact of a delegate
+plan before committing to it, so two plans can be compared.
+
+**Why this matters:** `planner.go` builds delegate trees and #306 computes the
+fee delta signatures add, but nothing lets a caller compare two candidate plans.
+A tree that authorizes the same thing can differ several-fold in signatures and
+fee, and that choice is currently made blind.
+
+_Acceptance criteria_
+
+- A plan yields a comparable estimate without performing any signing.
+- The estimate covers signature count, signing round trips and fee impact.
+- Two plans for the same authorization are comparable and the cheaper one is
+  identifiable.
+- The estimate's accuracy is checked against a real signed entry in a test.
+
+_Implementation guidance_
+
+- Build on #306's fee work if it has landed rather than reimplementing the fee
+  delta.
+- Report estimates as estimates, with the assumptions listed; precision here
+  would be false.
+- The accuracy test against a real entry is what keeps the model honest.
+
+#### feat(api): typed traversal of an invocation's ScVal arguments
+
+A typed walk over an invocation's arguments, so a caller can find the addresses
+and amounts inside them without hand-decoding XDR unions.
+
+**Why this matters:** The security question about an entry is almost always
+inside the arguments — which address receives, what amount. `Inspect` reports
+the function and an argument count, so anyone asking the real question drops
+into `go-stellar-sdk`'s unions and writes the traversal themselves, which is
+where the mistakes are.
+
+_Acceptance criteria_
+
+- Every `ScVal` type is handled, including nested maps and vectors, with no
+  panic on any input.
+- Addresses and integer amounts anywhere in the tree can be located by a caller.
+- Depth and size bounds from the decode policy apply to the traversal.
+- A fuzz target runs the traversal over arbitrary input and finds no panic.
+
+_Implementation guidance_
+
+- Enumerate the `ScVal` arms from the SDK source and cite the file; a missed arm
+  is a panic.
+- Reuse `internal/decodepolicy` for the bounds instead of adding new limits.
+- This is reporting only — it must not influence what is signed.
+
+#### feat(api): compare an entry against the simulation that produced it
+
+Check that an entry about to be signed matches the simulation response it came
+from, and report any difference as a structured finding.
+
+**Why this matters:** The normal flow is simulate, then sign what came back, and
+nothing verifies that the entry being signed is still the entry simulated. An
+entry altered between those steps — by a bug or a hostile intermediary — is
+signed without complaint, and that is the single highest-value check in the
+whole flow.
+
+_Acceptance criteria_
+
+- An entry and a simulation response are compared and differences reported per
+  field path.
+- A changed invocation, address or nonce is a finding; an added signature is
+  not.
+- The comparison is available before signing and is cheap enough to run every
+  time.
+- Tests cover an unmodified entry and a tampered one for each arm.
+
+_Implementation guidance_
+
+- `diff.go` already distinguishes payload-affecting changes from signature
+  changes; reuse that distinction exactly.
+- `rpcflow/rpcfixture` has recorded responses to test against without a network.
+- Make it easy to call: a check nobody runs because it is awkward provides no
+  protection.
+
+#### feat(api): machine-readable code on every exported error
+
+Give each sentinel error a stable string code, exposed through an interface, so
+callers and bindings can branch on it without matching message text.
+
+**Why this matters:** The bindings each map Go errors to their own exception
+types by inspecting the error, and the CLI has machine-readable output, so the
+message text has effectively become an API that nothing protects. Rewording an
+error for clarity can silently break a binding's error mapping.
+
+_Acceptance criteria_
+
+- Every exported sentinel carries a stable code, and a test asserts the codes
+  are unique.
+- A test fails if a sentinel is added without a code.
+- The bindings map on codes rather than on message text.
+- The codes are documented as stable, with a stated policy for changing one.
+
+_Implementation guidance_
+
+- `errors.Is` stays the Go-side mechanism; codes are for crossing language
+  boundaries.
+- The completeness test is what matters: enumerate sentinels and require a code
+  for each.
+- Once published, a code cannot change — say so in the documentation and the
+  policy.
+
+#### feat(api): injectable clock and ledger source for deterministic tests
+
+Let callers supply the current time and latest ledger wherever the library
+derives an expiration, so downstream tests are deterministic.
+
+**Why this matters:** Anything computing a relative expiration reads an ambient
+current ledger, so a downstream test either hard-codes a number that goes stale
+or is time-dependent and flaky. #323's test builders will hit the same wall, and
+the fix belongs in the library rather than in every consumer.
+
+_Acceptance criteria_
+
+- Every path deriving an expiration accepts an injectable source, with the
+  ambient one as default.
+- A test using a fixed source produces identical output across runs.
+- No new global or package-level mutable state is introduced.
+- The existing call signatures keep working unchanged.
+
+_Implementation guidance_
+
+- Pass the source explicitly rather than through a package variable; a global
+  here is a data race waiting to happen.
+- Grep for every place a current ledger or time is read before designing the
+  interface.
+- Keep the default behaviour byte-identical, proved by the golden vectors.
+
+#### feat(api): bound the total work an entry can demand
+
+A total-work budget across decode, traversal and verification, so a structurally
+legal entry cannot cost unbounded CPU.
+
+**Why this matters:** `decodepolicy` bounds decode depth and input size, which
+stops the obvious attacks, but a legal entry within those bounds can still have
+a wide delegate tree with many signatures to verify. The verification service
+and the browser build both process untrusted entries, and neither has a ceiling
+on the work one request can cause.
+
+_Acceptance criteria_
+
+- A single budget covers decode, traversal and signature verification.
+- Exceeding it returns a distinct, typed error naming the budget.
+- The default is documented with the measurement that justifies it.
+- A test uses a legal but expensive entry and asserts it is refused within the
+  budget.
+
+_Implementation guidance_
+
+- Measure before choosing the default and report the numbers; an invented limit
+  is either useless or breaks real entries.
+- Extend `decodepolicy` rather than adding a parallel limit mechanism.
+- Keep tightening possible and loosening beyond the default impossible, as the
+  decode limits already do.
+
+#### feat(api): progress observation for long batch operations
+
+Report progress during a long batch sign or verify, so a caller can show it and
+cancel knowing how far it got.
+
+**Why this matters:** `batch_sign.go` handles high-throughput batches that can
+run for a long time. From outside, the call is opaque until it returns, so a CLI
+or service has nothing to display and an operator cancelling has no idea whether
+it was nearly done.
+
+_Acceptance criteria_
+
+- Progress is reported through the existing hooks, with completed and total
+  counts.
+- Reporting adds no measurable cost when no observer is attached, shown by a
+  benchmark.
+- Cancellation reports how far it got, without returning a partial result.
+- The TUI or CLI consumes it, so the feature has a real caller.
+
+_Implementation guidance_
+
+- Extend `hooks.go` rather than adding a callback parameter to the batch API.
+- The no-observer benchmark is the acceptance gate; this must not slow the hot
+  path.
+- Progress is not a partial result: the all-or-nothing contract stays.
+
+#### feat(api): risk rules loaded from configuration
+
+Let the analyzer's rules be supplied as configuration, so an operator can add a
+rule without changing the library.
+
+**Why this matters:** `risk.go`'s findings are compiled in, and
+`policy/rules.go` already shows this repository expresses rules as data. Every
+operator has at least one organisation-specific rule — an address allowlist, an
+amount ceiling — and today the only ways to get one are to fork or to
+re-implement the analyzer.
+
+_Acceptance criteria_
+
+- Rules can be supplied as configuration and are evaluated alongside the
+  built-in ones.
+- A malformed rule set is refused at load time with the offending rule named,
+  never silently skipped.
+- Configured rules cannot suppress a built-in finding.
+- Tests cover a valid rule set, a malformed one and an attempt to suppress a
+  built-in finding.
+
+_Implementation guidance_
+
+- Reuse `policy/rules.go`'s vocabulary rather than inventing a second rule
+  language in the same repository.
+- Fail closed at load time: a rule that silently does not apply is worse than no
+  rule.
+- Built-in findings are a floor, not a default to be overridden — enforce that
+  in code.
+
+### `area:docs`
+
+#### docs: incident runbook for a failed or suspicious signature
+
+A runbook for the operational emergencies: a submission rejected on chain, a
+signature nobody can account for, a signer behaving unexpectedly, a suspected
+key compromise.
+
+**Why this matters:** There is documentation for what verification establishes
+and what to do when a submission fails, but nothing for the case where something
+has already gone wrong and someone is deciding whether to stop signing. That
+decision gets made under time pressure, which is the worst moment to be reading
+the API reference.
+
+_Acceptance criteria_
+
+- Each scenario has detection signals, immediate containment steps and an
+  escalation path.
+- Every command in the runbook is one that exists and is tested as a documented
+  snippet.
+- The limits are stated plainly: what the library's records can and cannot tell
+  you after the fact.
+- It links to the audit record and transcript features rather than restating
+  them.
+
+_Implementation guidance_
+
+- Write it for someone under pressure: short steps, no background reading
+  required.
+- Verify every command against the current CLI; a runbook with a stale flag is
+  actively harmful.
+- Be honest about the forensic limits — without an audit log, some questions
+  simply cannot be answered.
+
+#### docs: key compromise playbook
+
+What to do when a signing key is believed compromised, for each custody model
+the repository supports.
+
+**Why this matters:** A Stellar account's address is its public key, so a
+compromised key cannot be rotated the way a password can — the response is
+different for a classic multisig account, a threshold account and a custom
+account contract. That difference is exactly what an operator will not work out
+correctly during an incident.
+
+_Acceptance criteria_
+
+- A procedure per custody model, stating what can and cannot be recovered.
+- The irreversibility is stated plainly where it applies.
+- Preventive measures are separated from incident response.
+- Any claim about on-chain behaviour cites the protocol source or an e2e result.
+
+_Implementation guidance_
+
+- Do not imply recovery is possible where it is not; false hope here costs
+  money.
+- Cover the threshold case properly — share refresh and DKG change what is
+  possible.
+- Keep it separate from `SECURITY.md`, which is about reporting vulnerabilities
+  in this library, and cross-link the two.
+
+#### docs: a getting-started guide per language binding
+
+A guide per binding — C, Node, Python, JVM, Rust, wasm — taking a reader from
+install to a signed entry in their own language.
+
+**Why this matters:** Each binding has a README describing its build, which is
+written for someone working on the binding rather than using it. A Python or JVM
+developer currently has to read Go documentation and infer the mapping, which is
+the main reason the bindings see little use.
+
+_Acceptance criteria_
+
+- Each guide goes from install to a signed entry with complete, runnable code.
+- Every snippet is compiled or executed in CI, so none can go stale.
+- Error handling is shown in the language's own idiom, not translated from Go.
+- Each guide states what that binding does not support.
+
+_Implementation guidance_
+
+- The repository already verifies README snippets compile — extend that
+  mechanism rather than trusting review.
+- Idiomatic error handling is the part most worth getting right; a Go-shaped API
+  in Python will not be used.
+- State the gaps honestly: several bindings cannot be installed from a package
+  registry yet.
+
+#### docs: trust boundaries across the whole system
+
+A document identifying every trust boundary the project now spans — FFI, HTTP,
+gRPC, browser, cloud KMS, multi-party — and what each one assumes.
+
+**Why this matters:** The threat model was written when this was a Go library.
+It now crosses six language boundaries, two network services and a browser, and
+each of those was added with its own local reasoning. Nobody can currently
+answer which assumptions hold across the whole system, which is the question an
+adopter's security review asks first.
+
+_Acceptance criteria_
+
+- Every boundary is identified with what crosses it and what is assumed about
+  each side.
+- Assumptions that are not enforced in code are marked as such.
+- Each boundary links to the code and the tests that defend it.
+- The document states what is explicitly out of scope.
+
+_Implementation guidance_
+
+- Marking unenforced assumptions is the most valuable part; that list is the
+  real risk register.
+- Build on the existing threat model rather than replacing it.
+- Link to the FFI threading contract and the service hardening posture instead
+  of restating them.
+
+#### docs: published compatibility and support matrix per release
+
+A generated matrix of Go versions, SDK versions, protocol versions, binding
+language versions and platforms, published with each release.
+
+**Why this matters:** This information exists in `go.mod`,
+`docs/sdk-support.md`, the binding manifests and the protocol matrix, and the
+pieces have disagreed before — the Go floor moved twice without the
+documentation following. An adopter asking what is supported has to assemble it
+from five places and may get a stale answer.
+
+_Acceptance criteria_
+
+- The matrix is generated from the authoritative files, never hand-maintained.
+- A disagreement between the matrix and any source file fails the build.
+- It is published with each release and kept with the versioned documentation.
+- Support levels are distinguished: tested, best-effort and unsupported.
+
+_Implementation guidance_
+
+- Generation is the point: a hand-written matrix is how this went stale before.
+- `internal/doccheck` already fails the build when documented versions disagree
+  with `go.mod` — extend it.
+- Be explicit about best-effort versus tested; several bindings and platforms
+  are not covered by CI.
+
+#### docs: a worked air-gapped signing procedure
+
+An end-to-end procedure for signing on a machine that has never been networked,
+with the commands, the file exchange and the verification steps on both sides.
+
+**Why this matters:** This is the custody model with the strongest guarantees
+and the least guidance. Operators attempting it today improvise the transfer,
+and the improvisation is where a signature gets applied to a different entry
+than the one reviewed.
+
+_Acceptance criteria_
+
+- The procedure covers both machines, including what is verified before signing
+  and after returning.
+- The payload-binding check is explicit, so a substituted entry is caught.
+- Every command is tested as a documented snippet.
+- What the air gap does and does not protect is stated.
+
+_Implementation guidance_
+
+- The verification step on the offline machine is the security property; make it
+  unmissable.
+- This pairs with the file-exchange signer work; write the document against the
+  real commands once they exist.
+- Do not overclaim: an air gap does not protect against a compromised offline
+  machine, and the document should say so.
+
+#### docs: operating a threshold or multi-party signing setup
+
+An operations guide for threshold signing: generating shares, distributing them,
+refreshing, handling an unavailable participant, and recovering from a lost
+share.
+
+**Why this matters:** `frost/` and `coordinator.go` provide the mechanism, and
+the hard part of threshold signing is operational, not cryptographic. A team
+that loses a share or has a participant go offline during a round has no
+guidance, and the wrong improvisation there can make an account permanently
+unusable.
+
+_Acceptance criteria_
+
+- Covers generation, distribution, refresh, unavailability and share loss.
+- States clearly at what point an account becomes unrecoverable.
+- Each procedure's commands are tested.
+- Accuracy is tied to the implementation, with a test or check that fails if
+  they diverge.
+
+_Implementation guidance_
+
+- The unrecoverable threshold is the most important fact in the document; put it
+  near the top.
+- Write it against the real API, not the intended one; note anything the
+  implementation does not yet support.
+- Coordinate with the DKG and refresh work so the document does not describe
+  unbuilt features as available.
+
+#### docs: capacity planning for the verification service
+
+Measured throughput and latency per entry shape, with the resulting sizing
+guidance and the limits that bound it.
+
+**Why this matters:** There are benchmarks for the signing path and metrics in
+the service, but nothing connecting them to how much hardware a given request
+rate needs. A delegate tree costs far more to verify than a simple entry, so a
+rate figure without an entry shape is meaningless — and that is the only kind of
+figure available today.
+
+_Acceptance criteria_
+
+- Throughput and latency are measured per entry shape, including a deep delegate
+  tree.
+- Sizing guidance follows from the measurements and names the hardware they were
+  taken on.
+- The work limits and rate limits are related to the numbers.
+- Every figure carries its date and the version measured.
+
+_Implementation guidance_
+
+- Reuse the existing benchmarks rather than producing a separate set that will
+  drift.
+- Date and version every number, as the README's evidence rule already requires.
+- Report the worst case as well as the typical one; capacity planning on an
+  average is how services fall over.
+
+### `area:integrations`
+
+#### feat(bindings): hand-written stable C header with an ABI version symbol
+
+Replace the cgo-generated `libsoroauth.h` with a committed, hand-written header,
+and export a `soroauth_abi_version()` symbol that callers can check before use.
+
+**Why this matters:** `build.sh` ships whatever cgo generates, so the header's
+contents are a build artifact rather than a reviewed interface: a field reorder
+or a changed signature reaches consumers with nothing failing. Every other
+binding sits on this ABI, so an unversioned header makes a breaking change
+undetectable until a downstream build breaks.
+
+_Acceptance criteria_
+
+- A committed header is the published interface, and a test fails when the
+  exported Go functions and the header disagree.
+- `soroauth_abi_version()` returns a monotonic integer, documented as
+  incrementing on any breaking ABI change.
+- The header carries no cgo-internal types in its public signatures.
+- `bindings/c/build.sh` installs the committed header rather than the generated
+  one.
+
+_Implementation guidance_
+
+- There are 11 `//export` functions today; enumerate them from the source rather
+  than from memory.
+- A test can parse the header and compare against the `//export` comments, which
+  keeps the check hermetic.
+- Do not change any existing signature in this issue; this is about pinning what
+  is already there.
+
+#### feat(bindings): publish the Python package to PyPI with built wheels
+
+A release pipeline that builds abi3 wheels for Linux and macOS on x86_64 and
+arm64, plus an sdist, and publishes them to PyPI with attestations on a version
+tag.
+
+**Why this matters:** `release.yml` publishes the container image,
+`@soroauth/wasm` and the docs site, but nothing publishes the Python binding, so
+the only way to install it is to clone the repository and build the shared
+library by hand. The binding exists and is tested; it is simply unreachable.
+
+_Acceptance criteria_
+
+- Wheels are built for linux and macOS on both architectures, and an sdist that
+  builds from source.
+- Publishing happens only from a version tag, and refuses to publish from any
+  other commit.
+- The published wheel is installed in a clean environment and the golden vectors
+  are replayed through it before the job succeeds.
+- Trusted publishing or a scoped token; no long-lived credential in the
+  workflow.
+
+_Implementation guidance_
+
+- `cibuildwheel` is the usual tool and handles the matrix; the shared library
+  must be bundled into the wheel.
+- The existing wasm publish job already has the tag-guard and provenance pattern
+  to copy.
+- abi3 keeps one wheel working across Python minor versions; state the floor in
+  `pyproject.toml`.
+
+#### feat(bindings): ship Python type stubs and py.typed
+
+`.pyi` stubs for the package's public surface and a `py.typed` marker, checked
+by a type checker in CI.
+
+**Why this matters:** `find` over `bindings/python` returns no `py.typed` and no
+`.pyi`, so every consumer gets `Any` for the whole API. For a library whose
+arguments are base64 XDR strings, hex payloads and ledger numbers, an unchecked
+signature is the easy way to pass the wrong one of three strings.
+
+_Acceptance criteria_
+
+- `py.typed` is present and included in the built distribution.
+- Stubs cover every public function and the exception types, with the error
+  taxonomy typed as distinct classes.
+- A type checker runs in CI over the stubs and a small sample program, and fails
+  on a mismatch.
+- A deliberately wrong call in the sample is shown to be rejected by the
+  checker.
+
+_Implementation guidance_
+
+- Read `soroauth/ffi.py` and `_ffi.py` to separate the public surface from the
+  private one; only the former gets stubs.
+- Keep the stubs beside the module rather than in a separate stubs package, so
+  they ship with the wheel.
+- Prefer precise aliases (for example `Base64Xdr = str`) so the three string
+  kinds are not interchangeable to a reader.
+
+#### feat(bindings): publish the Node binding to npm with a prebuild matrix
+
+Publish `@soroauth/node` on a version tag with prebuilt binaries per platform,
+falling back to a source build when no prebuild matches.
+
+**Why this matters:** `@soroauth/wasm` is published but the native Node binding
+is not, although it has a `prebuilds/` directory and an install script that
+looks for one. Today those prebuilds only ever exist on the machine that built
+them, so installing the package means having a Go toolchain.
+
+_Acceptance criteria_
+
+- Prebuilds are produced for linux and macOS on x86_64 and arm64 and attached to
+  the published package or a release.
+- `npm install` in a clean container with no Go toolchain succeeds and the
+  golden vectors replay through it.
+- The source-build fallback is exercised in CI, not just the prebuild path.
+- Publishing is tag-gated with provenance, like the wasm job.
+
+_Implementation guidance_
+
+- `ci-node.yml` already uploads a prebuild artifact per platform; this is the
+  consumer of those artifacts.
+- Read `scripts/install.mjs` for the resolution order before changing where
+  prebuilds are looked up.
+- The macOS crash tracked in #518 affects the test harness, not the artifact; do
+  not block this on it, but say so in the PR.
+
+#### feat(bindings): publish the Rust crate to crates.io
+
+Release the Rust binding to crates.io on a version tag, with the crate metadata,
+docs.rs configuration and a build that does not require a network fetch of the
+Go library.
+
+**Why this matters:** The crate exists with a `build.rs` and tests but is not
+published, so `cargo add soroauth` does not work and the crate's version is not
+tied to the library's. docs.rs also never renders it, which is where Rust
+consumers look first.
+
+_Acceptance criteria_
+
+- Publishing is tag-gated and refuses a dirty or untagged tree.
+- The crate builds on docs.rs, where no Go toolchain exists, or documents and
+  configures the feature that makes that possible.
+- `cargo publish --dry-run` runs in CI on every pull request that touches the
+  crate.
+- The crate version and the repository tag cannot diverge; a test or the
+  workflow enforces it.
+
+_Implementation guidance_
+
+- Read `build.rs` first: whatever it does at build time is the constraint on
+  docs.rs.
+- `docs.rs` metadata goes in `[package.metadata.docs.rs]`; a documented `cfg`
+  that skips the native build is the usual answer.
+- Keep the vendored or prebuilt library story explicit in the README rather than
+  implicit in `build.rs`.
+
+#### feat(bindings): publish the JVM binding to Maven Central
+
+Publish the JVM artifact with its native library bundled per platform, signed,
+on a version tag.
+
+**Why this matters:** The JVM binding has a `pom.xml` and a `native/build.sh`
+but no publish path, so the only consumer is a local `mvn install`. Maven
+Central also requires signing and javadoc/sources jars, none of which exist yet,
+so this is not a one-line addition.
+
+_Acceptance criteria_
+
+- A signed artifact with sources and javadoc jars is published from a version
+  tag.
+- Native libraries for linux and macOS on both architectures are bundled and
+  selected at runtime.
+- A clean-container consumer test resolves the published artifact and replays
+  the golden vectors.
+- The signing key is a CI secret and never appears in logs.
+
+_Implementation guidance_
+
+- Read `native/build.sh` for the current output naming; runtime selection must
+  match it exactly.
+- Central's requirements (POM metadata, signatures, javadoc) are the bulk of
+  this work; check them before writing the workflow.
+- Keep the native library loading in one place so a new platform is a resource
+  addition, not a code change.
+
+#### feat(bindings): one cross-language conformance suite every binding runs
+
+A single committed suite of cases — vectors, error cases and limit cases — that
+each binding executes in its own language, reporting results in one comparable
+format.
+
+**Why this matters:** Each binding has its own tests, so each proves something
+slightly different and a behaviour can diverge in one language without any test
+disagreeing. `signertest` does this for Go `Signer` implementations; the
+bindings have no equivalent, which is exactly where divergence is most likely
+and least visible.
+
+_Acceptance criteria_
+
+- The case list is one committed data file, not duplicated per language.
+- Every binding runs the same cases and emits a common result format.
+- A case that one binding fails fails that binding's CI job and names the case.
+- Error cases are included, so an error mapped to the wrong class is a failure.
+
+_Implementation guidance_
+
+- Derive the case list from the existing golden vectors rather than inventing
+  inputs; add only the error and limit cases.
+- Each binding keeps its own thin runner; the shared thing is the data and the
+  output shape.
+- Keep the format trivially diffable so a divergence is readable without
+  tooling.
+
+#### feat(bindings): guarantee no Go panic crosses an FFI boundary
+
+Recover at every `//export` boundary and translate a panic into the ABI's error
+return, with a test that forces one.
+
+**Why this matters:** A panic that unwinds out of an exported cgo function takes
+the host process with it. Every binding sits on these 11 functions, so a single
+unexpected nil or out-of-range in library code becomes a hard crash of someone's
+Node server or JVM rather than an error they can handle.
+
+_Acceptance criteria_
+
+- Every exported function recovers and maps a panic to the ABI error path.
+- A test deliberately induces a panic behind the boundary and asserts the
+  process survives with an error returned.
+- The error says a panic occurred and carries no Go stack into the caller's
+  data.
+- A test enumerates the `//export` functions and fails if one lacks the guard.
+
+_Implementation guidance_
+
+- The enumeration test is what keeps this true as functions are added; write it
+  first.
+- Recovering is not a licence to continue: the error must be terminal for that
+  call, with no partial result written.
+- Do not log from library code; return the error and let the host decide.
+
+#### feat(bindings): document and test the threading contract of the C ABI
+
+State whether the exported functions may be called concurrently and from which
+threads, and prove it with a concurrent test under the race detector.
+
+**Why this matters:** Consumers in Node, the JVM and Python each have their own
+threading model and are already calling into this ABI with no stated contract.
+The macOS crash in #518 is a thread-and-stack interaction, which is the kind of
+thing an unstated contract invites; whatever the answer is, it needs to be
+written down and tested rather than inferred.
+
+_Acceptance criteria_
+
+- The README states the contract explicitly, including any function that is not
+  safe to call concurrently.
+- A concurrent test exercises the ABI from many goroutines under `-race` and
+  passes.
+- Each binding's README points at the contract rather than restating it.
+- If a function requires serialisation, the bindings enforce it and a test
+  proves it.
+
+_Implementation guidance_
+
+- Read the exported functions for shared state before writing the contract; the
+  contract must describe the code, not the wish.
+- A race-detector run is evidence for Go-side state only; say so rather than
+  implying it covers the host side.
+- Keep this separate from fixing #518: this documents and tests the intended
+  contract.
+
+#### feat(integrations): authentication and authorization for the verification service
+
+Pluggable request authentication for the HTTP service, with per-caller
+authorization over which operations are allowed.
+
+**Why this matters:** `server/` has hardening tests but the service itself is
+unauthenticated, so the documented posture is to keep it on a trusted network.
+Anyone who exposes it gains an open oracle that will decode and report on any
+entry submitted to it, and there is currently no in-tree way to put a credential
+in front of it.
+
+_Acceptance criteria_
+
+- At least one built-in scheme and an interface for others, selected by
+  configuration.
+- Authorization is per operation, so a caller can be allowed to verify but not
+  to sign.
+- A rejected request returns no information about the submitted entry.
+- Tests cover a missing credential, a wrong credential and an
+  authenticated-but-unauthorized call.
+
+_Implementation guidance_
+
+- Read `hardening_test.go` first and extend its posture rather than
+  contradicting it.
+- Constant-time comparison for any shared-secret scheme; a timing oracle here is
+  a real finding.
+- Keep the default closed: an unconfigured service should refuse, not allow.
+
+#### feat(integrations): request limits and backpressure for the verification service
+
+Per-caller rate limits, a concurrency cap and a request body limit, with the
+rejections exported as metrics.
+
+**Why this matters:** Decoding an authorization entry is unbounded work from the
+caller's point of view: a large delegate tree costs real CPU. With no limit, one
+client can starve the rest, and `decodepolicy`'s depth bounds protect
+correctness rather than availability.
+
+_Acceptance criteria_
+
+- Body size, request rate and in-flight concurrency are all bounded and
+  configurable.
+- A rejection returns the appropriate status with a retry hint and is counted in
+  metrics.
+- Limits are enforced per caller identity when one is available and per
+  connection otherwise.
+- A test drives the service past each limit and asserts it stays responsive.
+
+_Implementation guidance_
+
+- `internal/decodepolicy` already bounds decode depth and input size; reuse
+  those numbers rather than inventing new ones.
+- Shed load before decoding, not after, or the limit does not protect the
+  expensive part.
+- Add the counters to the existing metrics registry so the reference dashboard
+  can show them.
+
+#### feat(integrations): structured request logging with correlation IDs
+
+Structured logs for every request, carrying a correlation ID that is accepted
+from the caller or generated, and propagated into the response and any trace.
+
+**Why this matters:** Operating the service means answering which request
+produced a given result, and there is no way to do that today. The library
+deliberately does not log, which is correct, but the service is an application
+and needs it; the two must not be conflated.
+
+_Acceptance criteria_
+
+- One structured log line per request with method, route, status, duration and
+  correlation ID.
+- A caller-supplied correlation ID is used when present and a generated one
+  otherwise, and is returned in the response.
+- No entry contents, addresses or signatures appear in logs at the default
+  level.
+- A test asserts the redaction, not just the presence of the fields.
+
+_Implementation guidance_
+
+- `log/slog` is in the standard library and needs no dependency.
+- The redaction test is the important one: the natural implementation logs the
+  request body.
+- Keep logging in `server/` only; the library's no-logging rule stands.
+
+#### feat(integrations): graceful shutdown and readiness for the verification service
+
+Separate liveness and readiness endpoints, and a shutdown that stops accepting
+work, drains in-flight requests within a deadline, then exits non-zero if it
+could not.
+
+**Why this matters:** Under any orchestrator, a service without readiness gets
+traffic before it can serve it, and one without draining drops in-flight
+verifications on every deploy. For a signing-adjacent service, a dropped request
+is ambiguous to the caller, which is worse than a refused one.
+
+_Acceptance criteria_
+
+- Liveness and readiness are distinct, and readiness reports false during
+  shutdown.
+- In-flight requests are drained within a configurable deadline.
+- Exceeding the deadline exits non-zero and logs how many requests were
+  abandoned.
+- A test starts the service, holds a request open and asserts the drain
+  behaviour.
+
+_Implementation guidance_
+
+- `http.Server.Shutdown` does the draining; the work is the readiness flip and
+  the deadline handling.
+- Flip readiness before closing the listener, or load balancers keep sending
+  work.
+- Make the deadline configurable, since a long verification is legitimate.
+
+#### feat(integrations): generate and test clients from the OpenAPI specification
+
+Generate at least one client from the committed specification in CI and run it
+against the real service, failing when the specification and the implementation
+disagree.
+
+**Why this matters:** `server/openapi.yaml` is committed and there is a
+`zz_generate_scrape_test.go`, so the specification is checked for drift against
+the handlers, but nothing proves a generated client can actually talk to the
+service. A specification that is structurally accurate can still be unusable.
+
+_Acceptance criteria_
+
+- A client is generated in CI from the committed specification, not from a
+  hand-written copy.
+- The generated client exercises every documented operation against a running
+  instance.
+- A deliberate mismatch between specification and handler fails the job.
+- The generated code is not committed, or if it is, a check proves it is
+  current.
+
+_Implementation guidance_
+
+- Read `zz_generate_scrape_test.go` to see what drift is already caught, and
+  cover what it cannot.
+- One generator is enough; pick the one whose output is easiest to run in CI.
+- Error responses are the usual gap — include at least one failure path in the
+  client test.
+
+#### feat(integrations): audit log for every verification the service performs
+
+An append-only audit record per request — who asked, what was decided, when,
+under which policy — written to a configurable sink and separate from
+operational logs.
+
+**Why this matters:** #319 covers an audit record inside the library for signing
+decisions. The service makes decisions of its own, for callers who are not the
+operator, and an operator asked after the fact which entries were approved has
+no answer. These are different records with different retention needs and should
+not be the same stream.
+
+_Acceptance criteria_
+
+- One record per decision, with a stable schema and a schema version field.
+- The sink is configurable and a write failure is a request failure, not a
+  silent drop.
+- Records identify the entry by hash rather than carrying its contents.
+- Tests cover the schema, the write-failure path and the absence of secrets.
+
+_Implementation guidance_
+
+- Decide and document retention expectations; an audit log that grows unbounded
+  gets deleted in a hurry.
+- Hash rather than store: the record must be useful without being a copy of
+  everyone's entries.
+- If #319 lands first, reuse its record shape where it fits rather than
+  inventing a second vocabulary.
+
+#### feat(integrations): mutual TLS and certificate pinning for the gRPC service
+
+mTLS for the gRPC signing and verification service, with client certificate
+verification and optional pinning, configured declaratively.
+
+**Why this matters:** A gRPC signing service is a far more sensitive endpoint
+than the HTTP verifier: it holds or proxies signing authority. Transport
+security and client identity are the minimum for that, and the documented
+posture of a trusted network does not survive contact with a real deployment.
+
+_Acceptance criteria_
+
+- Server and client both require certificates, and an unverified client is
+  refused before any method runs.
+- Pinning is available and optional, with the behaviour when a pin fails
+  documented.
+- Tests cover an untrusted client, an expired certificate and a pin mismatch.
+- The insecure path, if kept for tests, cannot be enabled by default or by
+  accident.
+
+_Implementation guidance_
+
+- Read the existing service setup before adding credentials; the interceptor
+  order matters.
+- Refuse at the transport layer; an authorization check inside a method is too
+  late.
+- Make the test certificates generated at test time, never committed.
+
+#### feat(integrations): streaming batch signing over gRPC
+
+A bidirectional streaming method that accepts entries and returns signed results
+as they complete, with per-item errors that do not abort the stream.
+
+**Why this matters:** `batch_sign.go` exists for high-throughput signing
+in-process, but the gRPC service exposes only unary calls, so a caller with ten
+thousand entries pays a round trip each. Unary calls also force all-or-nothing
+error handling, which is the wrong shape for a batch.
+
+_Acceptance criteria_
+
+- A streaming method handles a batch larger than fits comfortably in one
+  message.
+- A failure on one item is reported against that item and the stream continues.
+- Backpressure is respected rather than buffering the whole batch in memory.
+- A test streams a batch containing a deliberate failure and asserts the others
+  still complete.
+
+_Implementation guidance_
+
+- Reuse `batch_sign.go` rather than reimplementing concurrency in the service.
+- The all-or-nothing rule in `AuthorizeAll` is deliberate; this is a different
+  contract, so state it explicitly in the proto comments.
+- Bound the in-flight window or a client can still exhaust the server's memory.
+
+#### feat(integrations): browser extension support for hardware and passkey signing
+
+Let the extension complete a signature with a passkey or a connected hardware
+wallet, rather than only explaining what an entry does.
+
+**Why this matters:** The extension explains an entry before signing, which is
+the useful half, but the user must then sign somewhere else — and the thing they
+sign elsewhere is not provably the thing the extension explained. Closing that
+gap is the point of having the explanation in the browser at all.
+
+_Acceptance criteria_
+
+- A passkey signature can be produced and the resulting entry exported.
+- The payload signed is shown to be the payload explained, by hash, in the UI.
+- A refusal or timeout at the authenticator leaves no partial entry.
+- Tests cover the happy path, a user refusal and a payload that changed between
+  explain and sign.
+
+_Implementation guidance_
+
+- `webauthn.go` and `secp256r1.go` already have the assertion parsing and
+  verification primitives; reuse them through the wasm build.
+- The hash-match display is the security property; design it so a mismatch is
+  impossible to miss.
+- Hardware wallet support may need a separate transport; scope it to passkeys if
+  the transport is not available.
+
+#### feat(integrations): offline-first signing in the browser with no network at all
+
+A documented and tested browser flow that loads, inspects and signs with no
+network request after the initial page load, verified by a test that fails the
+run on any request.
+
+**Why this matters:** Air-gapped signing is a real operational requirement, and
+the wasm build plus a passkey is enough to do it entirely in the page. Nothing
+currently proves the page makes no network call, so the claim cannot be made; an
+unnoticed analytics or font fetch would quietly break it.
+
+_Acceptance criteria_
+
+- A flow from entry to signed entry completes with the network disabled after
+  load.
+- An automated test fails if any request is made after load, including fonts and
+  source maps.
+- The page's assets are all local, with no CDN reference.
+- The documentation states what offline does and does not protect against.
+
+_Implementation guidance_
+
+- Intercept at the browser automation layer and fail on any request; an
+  assertion about counts is weaker.
+- `examples/browser-passkey` is the obvious starting point; check what it
+  currently fetches.
+- Do not claim air-gap safety beyond the page itself: the host machine is still
+  in scope, and the docs should say so.
+
+#### feat(integrations): reproducible wasm builds with a published digest
+
+Make the wasm artifact byte-identical across rebuilds of a tag, publish its
+digest, and verify a rebuild in CI the way `reproducible.yml` does for the
+binaries.
+
+**Why this matters:** `reproducible.yml` rebuilds the released binaries and
+diffs them against the published checksums, but the wasm package published to
+npm has no equivalent. A browser artifact is the one consumers are least able to
+audit themselves, so it is the one that most benefits from a reproducible
+digest.
+
+_Acceptance criteria_
+
+- Two builds of the same tag produce identical bytes.
+- The digest is published with the release and with the npm package.
+- A CI job rebuilds from the tag and fails on any difference.
+- Any source of non-determinism found is documented and removed rather than
+  tolerated.
+
+_Implementation guidance_
+
+- `scripts/reproduce.sh` and `reproducible.yml` are the pattern; follow them
+  rather than inventing a second mechanism.
+- Embedded build timestamps and paths are the usual culprits; `-trimpath` and a
+  fixed date handle most of it.
+- Verify against the artifact actually published, not a locally built one.
+
+#### feat(integrations): GitHub Action verifies a transaction envelope, not only entries
+
+Extend the action to accept a full `TransactionEnvelope`, report every entry it
+contains, and fail on configurable conditions across the whole envelope.
+
+**Why this matters:** The action verifies entries one at a time, but what a
+reviewer actually has in a pull request or a change record is an envelope.
+Splitting it by hand before running the action is both a chore and a place to
+drop an entry, which is the failure the action exists to prevent.
+
+_Acceptance criteria_
+
+- An envelope input is accepted and every entry in it is reported.
+- Failure conditions can be expressed over the envelope, such as any unsigned
+  address entry.
+- The summary names each entry by index and address.
+- Tests cover an envelope with mixed credential arms, including a source-account
+  entry.
+
+_Implementation guidance_
+
+- `envelope.go` already has the extraction helpers; reuse them rather than
+  parsing in the action.
+- Source-account entries are legitimately unsigned — treating them as a finding
+  would make the action useless.
+- Keep the single-entry input working; this is an addition.
+
+#### feat(integrations): Kubernetes manifests and a Helm chart for the verification service
+
+Reference manifests and a chart that deploy the service with the readiness,
+limits, metrics and configuration the repository already provides, validated in
+CI.
+
+**Why this matters:** The container image is published and the service has
+metrics, but there is no deployment reference, so every operator reconstructs
+probes, limits and scrape configuration from the source. That is exactly where a
+readiness probe gets pointed at a liveness endpoint and a deploy starts dropping
+requests.
+
+_Acceptance criteria_
+
+- Manifests and a chart deploy the published image and pass a dry-run validation
+  in CI.
+- Probes, resource requests and metric scraping are configured and match what
+  the service exposes.
+- Secrets are referenced, never inlined, and the chart fails rather than
+  defaulting to an insecure configuration.
+- A smoke test deploys into a throwaway cluster and verifies one request end to
+  end.
+
+_Implementation guidance_
+
+- `kind` is enough for the smoke test and runs in Actions.
+- Keep the chart thin; a reference that is hard to read is not a reference.
+- Point the probes at the endpoints that actually exist today rather than ones
+  this issue hopes for.
+
+#### feat(integrations): Terraform module for the verification service
+
+A module that provisions the service on one cloud, with its network posture,
+secrets wiring and metrics scraping, validated by a plan in CI.
+
+**Why this matters:** The service is explicitly documented as needing a trusted
+network, which is an infrastructure property that no amount of application code
+can establish. Shipping the network posture as code is the only way that advice
+becomes checkable rather than aspirational.
+
+_Acceptance criteria_
+
+- The module provisions the service and its network restrictions on one named
+  cloud.
+- `terraform validate` and a plan run in CI on every change to the module.
+- No credential is stored in the module or its state examples.
+- The README states exactly what the module does and does not protect.
+
+_Implementation guidance_
+
+- One cloud done well beats three done partially; say in the README which one
+  and why.
+- Default to private networking; a module that defaults to a public endpoint
+  undoes the point.
+- A plan in CI needs no credentials if the provider is configured for validation
+  only.
+
+#### feat(integrations): signed SBOM for every published artifact
+
+Generate an SBOM for each released artifact — binaries, container image, wasm
+package and each language binding — sign it, and attach it to the release.
+
+**Why this matters:** The release already produces SLSA provenance and signed
+artifacts, which says who built them, but not what is inside them. For a signing
+library whose consumers have their own supply-chain review to pass, a component
+inventory is usually the thing they are required to collect.
+
+_Acceptance criteria_
+
+- An SBOM accompanies every published artifact, not only the Go binaries.
+- Each SBOM is signed and verifiable with the documented command.
+- A CI job verifies the signature and the SBOM's completeness before the release
+  is marked ready.
+- The documentation shows a consumer how to verify one.
+
+_Implementation guidance_
+
+- The bindings are the interesting part: each pulls in a different ecosystem's
+  dependencies.
+- Reuse the existing cosign setup rather than introducing a second signing
+  mechanism.
+- A generated SBOM nobody can verify is paperwork; the verification job is the
+  point.
+
+#### feat(integrations): continuous vulnerability scanning of the published surface
+
+A scheduled job that scans the published container image and every published
+package for known vulnerabilities and opens an issue on a finding.
+
+**Why this matters:** `security.yml` and dependency review cover the source at
+pull-request time, but a vulnerability disclosed after a release affects
+artifacts already in use and nothing is watching those. The gap between a CVE
+being published and anyone here noticing is currently unbounded.
+
+_Acceptance criteria_
+
+- The published image and packages are scanned on a schedule, not only at build
+  time.
+- A finding opens an issue with the affected artifact, version and advisory.
+- A finding below a configured severity is recorded without opening an issue.
+- The job cannot fail silently: a scanner error is itself reported.
+
+_Implementation guidance_
+
+- `fuzz.yml` already files issues from a scheduled run; copy that mechanism.
+- Deduplicate against existing open issues or a long-lived CVE reopens weekly.
+- Scan what was published, resolved by digest, not what a fresh build would
+  produce.
+
+#### feat(integrations): expose the risk analyzer through the verification service
+
+An endpoint that returns the analyzer's findings for a submitted entry, with
+severities, in the service's documented response shape.
+
+**Why this matters:** `risk.go` is the most useful thing to run against an entry
+you did not build, and it is currently reachable only from Go or the CLI. A
+reviewer with an entry and a browser has no way to get its findings, which is
+the situation the service exists to serve.
+
+_Acceptance criteria_
+
+- Findings are returned with severity and a stable identifier per finding type.
+- The OpenAPI specification is updated and the drift check passes.
+- The endpoint is covered by the same limits and authentication as the rest of
+  the service.
+- The response documents that findings are heuristics, matching the analyzer's
+  own documented limits.
+
+_Implementation guidance_
+
+- Read `risk.go` for the finding types and keep the identifiers stable;
+  consumers will match on them.
+- `docs/` already states the analyzer's limits — link to it rather than
+  restating it in the API docs.
+- Do not let the endpoint imply approval: a clean result is not a safety
+  guarantee, and the shape should say so.
+
+#### feat(integrations): WASI build of the signing core for sandboxed hosts
+
+A WASI target alongside the browser wasm build, so the core can run in a
+sandboxed runtime with no JavaScript host.
+
+**Why this matters:** The browser build assumes a JS host for everything,
+including moving bytes across the boundary. Sandboxed server-side runtimes are a
+natural fit for a signing core precisely because the sandbox is a real boundary,
+and that deployment is impossible today.
+
+_Acceptance criteria_
+
+- A WASI artifact is produced and runs under at least one named runtime.
+- The golden vectors replay through the WASI build byte for byte.
+- The artifact's size is reported and budgeted like the browser build.
+- The documentation states which host capabilities it needs, and that it needs
+  no network.
+
+_Implementation guidance_
+
+- Read `cmd/soroauthwasm` for the existing boundary before designing a second
+  one.
+- Keep the two targets sharing one core; a divergent second implementation is
+  the thing to avoid.
+- `ci-wasm.yml` already enforces a size budget — extend it rather than adding a
+  parallel check.
+
+#### feat(integrations): fixture contract exercising every credential arm in one transaction
+
+A contract and e2e scenario that requires authorization from a source-account
+entry, a legacy address entry, a V2 entry and a delegates entry in a single
+transaction.
+
+**Why this matters:** The e2e scenarios each prove one arm. Nothing proves the
+arms compose, and the host checks them together: an entry ordering or nonce
+interaction that only appears when all four are present would pass every test in
+the repository today.
+
+_Acceptance criteria_
+
+- One transaction carries all four credential arms and is accepted on testnet.
+- The scenario logs the hash, the ledger and the arm observed for each submitted
+  entry, decoded from the envelope.
+- A negative variant with one arm's signature removed is rejected, and the raw
+  error is reported.
+- `RESULTS.md` records the run.
+
+_Implementation guidance_
+
+- Reuse the shared fixture deployment harness rather than deploying another
+  contract from scratch.
+- Two simulation passes are required once delegates are involved; the existing
+  delegate scenario shows the shape.
+- Decode the submitted envelope to report the arms, as the existing scenarios
+  do; do not assume what was sent.
+
+#### feat(integrations): replay a recorded RPC flow against a live network to detect drift
+
+A scheduled job that replays the recorded RPC fixtures against live testnet and
+reports where the real responses no longer match the recordings.
+
+**Why this matters:** `rpcflow/rpcfixture` makes the offline flow tests fast and
+hermetic, which is right, but it also means those tests keep passing after the
+network's responses change shape. The fixtures' value depends on someone
+noticing when they go stale, and nothing does.
+
+_Acceptance criteria_
+
+- A scheduled job replays each fixture against testnet and reports differences.
+- A difference opens an issue naming the fixture and the field that moved.
+- The job distinguishes a changed response shape from a transient network
+  failure.
+- Pull-request runs stay offline and are unaffected.
+
+_Implementation guidance_
+
+- Compare shapes and the fields the tests rely on, not whole payloads, or ledger
+  numbers make every run differ.
+- Reuse the issue-filing pattern from `fuzz.yml`.
+- Never let this job rewrite the fixtures automatically; a human should see the
+  diff.
+
+#### feat(integrations): Stellar Wallets Kit adapter conformance against a real wallet
+
+Drive the wallet adapter through a real wallet implementation in a browser
+automation test, covering connect, sign and refuse.
+
+**Why this matters:** `adapters/walletsdk` is unit-tested against the interface
+it expects, which proves it is self-consistent rather than that it works with
+any real wallet. The adapter's whole purpose is the integration, and that is the
+part with no coverage.
+
+_Acceptance criteria_
+
+- A browser test drives connect, sign and user-refusal paths against a real
+  wallet build.
+- The signed entry produced is byte-compared against a golden vector.
+- A refusal leaves no partial entry and surfaces a typed error.
+- The test runs in CI, or is scheduled with its skip reason reported when it
+  cannot.
+
+_Implementation guidance_
+
+- A mock that implements the same interface proves nothing new; this needs the
+  real implementation.
+- If the wallet cannot run headless in CI, say so plainly and schedule the job
+  rather than pretending it runs per pull request.
+- Pin the wallet version; an unpinned dependency makes this test a source of
+  random failures.
+
+### `area:protocol`
+
+#### feat(protocol): generate preimages from the Rust host as a third reference
+
+Produce the preimage and payload for each vector using `rs-soroban-env`
+directly, and compare against the Go library and the JS SDK.
+
+**Why this matters:** The JS SDK is the reference today, but it is an
+independent reimplementation of the same specification, so a shared misreading
+between it and this library is invisible. `rs-soroban-env` is what the network
+actually runs, which makes it the authority rather than a peer.
+
+_Acceptance criteria_
+
+- Each vector's preimage and payload are produced from the Rust host and
+  compared with both other implementations.
+- A three-way disagreement fails and reports which implementation differs.
+- The Rust dependency is pinned exactly with its lockfile committed.
+- The comparison runs in CI, or is scheduled with its skip reason reported.
+
+_Implementation guidance_
+
+- Read the host's preimage construction and cite the file and function; do not
+  reimplement from the CAP text.
+- Report disagreements; never change a vector to make three implementations
+  agree.
+- A Rust toolchain is already pinned for the contracts — reuse that pin.
+
+#### feat(protocol): report the nonce ledger entry a signature will consume
+
+Compute the ledger key for the nonce entry an address credential will consume,
+so it can be included in a footprint and checked for existence.
+
+**Why this matters:** The host consumes a nonce entry when it verifies an
+address credential, and that entry must be in the transaction's footprint. A
+caller assembling a transaction by hand has no way to derive the key, so they
+either over-provision the footprint or discover the omission as an on-chain
+failure after fees.
+
+_Acceptance criteria_
+
+- The ledger key is derived for both CAP-71 arms and the legacy arm.
+- The derivation is checked against a real entry observed on testnet.
+- A nonce already consumed is distinguishable from one that is free.
+- The key's construction cites the host source it was read from.
+
+_Implementation guidance_
+
+- Read the key construction from `rs-soroban-env` and cite it; deriving it from
+  the CAP text is how this gets subtly wrong.
+- Verify against a live testnet transaction rather than only unit tests — this
+  is an on-chain fact.
+- Keep it offline and pure; fetching whether a nonce exists belongs in
+  `rpcflow`.
+
+#### feat(protocol): compatibility checker for entries across protocol versions
+
+Given an entry and a target protocol version, report whether it would be
+accepted, rejected, or accepted with different semantics.
+
+**Why this matters:** The third category is the dangerous one and nothing
+addresses it: an entry that is structurally valid on two versions but means
+something different on each. Protocol 28 added address binding, which is exactly
+that kind of change, and a caller submitting to a mixed-version environment has
+no tool to ask the question.
+
+_Acceptance criteria_
+
+- Three outcomes are distinguished: accepted, rejected and
+  accepted-with-different-semantics.
+- The semantics category is justified per case against a cited protocol source.
+- Nested delegates are considered, not just the top-level arm.
+- A test covers each arm against each supported version.
+
+_Implementation guidance_
+
+- Cite CAP-71-01 and CAP-71-02 for each semantic difference; an uncited claim
+  here is a guess.
+- Reuse `protocolmatrix.go`'s data rather than duplicating it.
+- Fail closed: an unknown combination is 'unknown', never 'accepted'.
+
+#### feat(protocol): check an entry corresponds to the operation it accompanies
+
+Verify that an entry's root invocation matches the `InvokeHostFunction`
+operation it is attached to, and report any divergence.
+
+**Why this matters:** An envelope carries operations and entries side by side,
+and nothing checks they agree. An entry authorizing a different contract call
+than the operation performs is the clearest possible sign of tampering, and it
+is currently undetectable without reading both by hand.
+
+_Acceptance criteria_
+
+- The operation's host function and the entry's root invocation are compared
+  field by field.
+- A mismatch is reported with the field path, not as one opaque difference.
+- An entry with no corresponding operation, and an operation with no entry, are
+  both reported.
+- Tests cover a matching envelope and a tampered one for each arm.
+
+_Implementation guidance_
+
+- `envelope.go` already extracts entries from an envelope; extend it rather than
+  re-parsing.
+- `diff.go`'s path-reporting style is the right output shape here.
+- Source-account entries are still subject to this check and must not be
+  exempted.
+
+#### feat(protocol): exhaustive vectors over arm and function-type combinations
+
+A generated vector for every combination of the four credential arms and the
+three authorized function types, with a test that fails when a combination is
+missing.
+
+**Why this matters:** There are four arms and three function types —
+`ContractFn`, `CreateContractHostFn` and `CreateContractV2HostFn` — and the
+vector set covers the combinations that came up rather than the matrix. The
+uncovered cells are where a reporting or preimage bug would sit undetected.
+
+_Acceptance criteria_
+
+- Every legal combination has a vector, and illegal combinations are documented
+  as such.
+- A test enumerates the matrix and fails on a missing cell.
+- The vectors are generated by the pinned JS SDK, not hand-written.
+- The CI drift check covers the new vectors.
+
+_Implementation guidance_
+
+- The three function types are what the SDK's xdr package defines; enumerate
+  from the source rather than from memory.
+- The enumerating test is the point: it keeps the matrix complete as arms are
+  added.
+- If a combination cannot be constructed, record why in the test rather than
+  omitting it silently.
+
+#### feat(protocol): map host rejection reasons to library errors
+
+A documented, tested mapping from the host's authorization failure messages to
+the library's typed errors, so an on-chain rejection can be explained.
+
+**Why this matters:** When a submission fails, the operator gets a host error
+string and has to guess which local condition caused it. The library knows about
+expiration, nonce reuse, ordering and signature shape, but there is no bridge
+between the two vocabularies, which makes a failed submission far harder to
+diagnose than it needs to be.
+
+_Acceptance criteria_
+
+- Each mapped host reason cites the host source where the message is produced.
+- An unmapped host error is reported as unmapped rather than guessed at.
+- At least the expiration, nonce, ordering and signature-shape failures are
+  covered.
+- An e2e scenario produces each mapped failure and the mapping is asserted
+  against the real error.
+
+_Implementation guidance_
+
+- Drive the mapping from real failures in e2e, not from reading the host and
+  hoping.
+- Host messages change between versions — record the version each mapping was
+  observed under.
+- Never guess: an unmapped error must say so, since a confident wrong
+  explanation is worse than none.
+
+#### feat(protocol): establish and enforce the host's delegate tree limits
+
+Determine the host's actual limits on delegate tree depth and breadth, document
+them with their source, and refuse an entry that exceeds them before it is
+signed.
+
+**Why this matters:** `WithDelegates` accepts arbitrarily deep and wide trees.
+If the host has a limit, a signature over an over-limit tree is wasted work that
+fails on chain after fees; if it does not, the resource cost still grows and the
+library should say so. Either way the current silence is the problem.
+
+_Acceptance criteria_
+
+- The limits, or their absence, are established from the host source and cited.
+- An entry exceeding a limit is refused with a typed error before signing.
+- The documented limits and the enforced ones cannot diverge, asserted by a
+  test.
+- An e2e scenario confirms the behaviour at the boundary on testnet.
+
+_Implementation guidance_
+
+- Read the host rather than inferring from behaviour, then confirm with e2e at
+  the boundary.
+- If there is no hard limit, document the resource cost instead and do not
+  invent one.
+- Coordinate with the decode bounds so there is one policy, not two.
+
+#### feat(protocol): validate every canonical ordering rule an entry must satisfy
+
+Enumerate every ordering and canonicality rule the host enforces on an entry,
+and validate all of them in one place.
+
+**Why this matters:** Delegate ordering is validated and multisig key ordering
+is enforced in the signer, but these were each added when someone noticed them.
+There is no enumeration of what the host requires, so nobody can say whether the
+list is complete — and a missed rule means an entry that fails on chain after
+fees.
+
+_Acceptance criteria_
+
+- The rules are enumerated with a citation to the host source for each.
+- All of them are validated through one entry point before signing.
+- A rule the library cannot check offline is documented as such rather than
+  omitted.
+- Tests cover a violation of each rule.
+
+_Implementation guidance_
+
+- The enumeration with citations is the deliverable; the validation is mostly
+  already written.
+- Reuse `ValidateDelegateOrder` and the multisig ordering check rather than
+  reimplementing them.
+- Be explicit about what cannot be checked offline; an incomplete list presented
+  as complete is the risk.
+
+#### feat(protocol): muxed account handling audited across the whole surface
+
+Audit every place an address is parsed, formatted or reported for muxed
+handling, and make the behaviour consistent and tested.
+
+**Why this matters:** `ParseAddress` refuses `M…` for credentials, which is
+correct, but muxed addresses can legitimately appear inside invocation
+arguments. The reporting, diff and risk paths each handle them by whatever their
+own code does, so a muxed address may be reported inconsistently or dropped, and
+a dropped recipient in a report is a security problem.
+
+_Acceptance criteria_
+
+- Every address-handling site is enumerated and its muxed behaviour stated.
+- A muxed address in an invocation argument is reported in full, never truncated
+  to its underlying account.
+- Credentials still refuse muxed addresses, unchanged.
+- Tests cover a muxed address in an argument through inspect, diff and the
+  renderer.
+
+_Implementation guidance_
+
+- Grep for every address formatting site before changing any of them; the audit
+  is the work.
+- Never silently convert a muxed address to its underlying account in a report —
+  that hides the recipient.
+- Keep the credentials rule exactly as it is; this is about arguments.
+
+#### feat(protocol): verify the invocation tree the host would reconstruct
+
+Compare the library's view of an invocation tree against the tree the host
+reports during simulation, and fail on divergence.
+
+**Why this matters:** #309 reconstructs the `__check_auth` context the host
+would pass. The adjacent question is whether the library's reading of the whole
+tree matches the host's, including sub-invocation order and depth. If it does
+not, every report and every risk finding is describing a different tree from the
+one being authorized.
+
+_Acceptance criteria_
+
+- The library's tree and the host's reported tree are compared structurally.
+- A divergence fails with the path at which the trees differ.
+- The comparison covers nested sub-invocations at more than two levels.
+- The check runs against recorded simulation responses offline and against
+  testnet in e2e.
+
+_Implementation guidance_
+
+- `rpcflow/rpcfixture` makes the offline half hermetic; use it for the
+  regression test.
+- Compare structure and order, not formatting.
+- If the trees diverge, report it rather than adapting the library's reading to
+  match — the cause matters.
+
+### `area:signers`
+
+#### feat(signers): distributed key generation for the threshold signer
+
+A DKG ceremony that produces FROST key shares without any participant ever
+holding the full private key, with a verifiable transcript.
+
+**Why this matters:** `frost.go` can sign with real key shares, but the shares
+have to come from somewhere, and today that means generating a key and splitting
+it — a moment when one machine holds everything. That single point of compromise
+defeats the reason for threshold signing in the first place.
+
+_Acceptance criteria_
+
+- Shares are produced with no participant and no coordinator ever holding the
+  full key.
+- Each participant can verify the ceremony completed correctly and that its
+  share matches the group key.
+- A participant that aborts or sends a malformed contribution is identified and
+  the ceremony fails closed.
+- Tests cover the happy path, an aborting participant and a malformed
+  contribution.
+
+_Implementation guidance_
+
+- Read `frost/frost.go` for the share representation already in use; the DKG
+  must produce exactly that.
+- Fail closed: a ceremony that cannot be verified must produce no usable share.
+- Cite the FROST specification section for each check rather than describing the
+  maths from memory.
+
+#### feat(signers): refresh threshold shares without changing the group key
+
+Proactive resharing that gives every participant a new share for the same public
+key, so an attacker must compromise a threshold within one refresh window.
+
+**Why this matters:** Without refresh, shares are valid for the lifetime of the
+account, and an attacker who takes one share per year eventually has a
+threshold. The account address cannot change, so re-keying is not an option and
+resharing is the only answer.
+
+_Acceptance criteria_
+
+- After a refresh the group public key and the account address are unchanged.
+- Old shares cannot be combined with new ones to sign.
+- A participant that misses a refresh is detected and cannot silently keep
+  signing with a stale share.
+- A test signs before and after a refresh and proves the mixed-share case fails.
+
+_Implementation guidance_
+
+- The mixed-share rejection is the property that matters most; write that test
+  first.
+- Depends on the DKG work for its transcript machinery — say so in the issue
+  rather than duplicating it.
+- Document the operational procedure, not just the API: a refresh nobody can run
+  is not a mitigation.
+
+#### feat(signers): identifiable abort for a failed threshold signing round
+
+When a threshold round fails, report which participant produced the invalid
+contribution, with evidence another party can check.
+
+**Why this matters:** A round that fails with 'signing failed' is operationally
+useless: with five participants the operator cannot tell a broken machine from a
+malicious one, and the only recovery is to retry and hope. Attribution is what
+turns a failure into an action.
+
+_Acceptance criteria_
+
+- A failed round names the participant whose contribution was invalid.
+- The accusation carries evidence that a third party can verify independently.
+- A participant cannot frame another by sending a crafted contribution, and a
+  test proves it.
+- The error type is distinct from a transport or timeout failure.
+
+_Implementation guidance_
+
+- Distinguish unavailable from invalid: a timeout is not an accusation and must
+  not be reported as one.
+- The anti-framing test is the hard part and the reason this is not a logging
+  change.
+- Keep the evidence small enough to include in an audit record.
+
+#### feat(signers): signed transcript for every threshold signing session
+
+A record of each session — participants, payload, rounds, outcome — signed by
+the coordinator so it can be audited after the fact.
+
+**Why this matters:** Multi-party signing is used precisely where someone will
+later ask who authorized what. `coordinator.go` orchestrates the rounds but
+keeps no durable account of them, so that question has no answer and the audit
+property people adopt threshold signing for is missing.
+
+_Acceptance criteria_
+
+- Every session produces a transcript identifying participants, the payload hash
+  and the outcome.
+- The transcript is signed and verifiable without the coordinator's cooperation.
+- A failed or aborted session produces a transcript too, with its failure
+  reason.
+- No key share or private material appears in a transcript, asserted by a test.
+
+_Implementation guidance_
+
+- Hash the payload rather than storing it; the transcript should not become a
+  copy of every entry.
+- Reuse the audit record shape from #319 if it has landed, rather than inventing
+  a second vocabulary.
+- A transcript only the coordinator can verify is worthless — independent
+  verification is the requirement.
+
+#### feat(signers): authenticated transport for coordinator rounds
+
+Mutual authentication and replay protection between the coordinator and
+participants, so a round's messages cannot be injected, replayed or reordered by
+the network.
+
+**Why this matters:** `coordinator.go` defines the rounds but leaves the channel
+to the caller, which means the security of a multi-party signature currently
+rests on undocumented assumptions about someone else's transport. An attacker
+who can inject a round message can influence which payload gets signed.
+
+_Acceptance criteria_
+
+- Participants and coordinator authenticate each other before any round material
+  is exchanged.
+- Replayed and reordered messages are rejected, and a test proves both.
+- Session binding prevents a message from one session being accepted in another.
+- The documentation states the transport's requirements for anyone supplying
+  their own.
+
+_Implementation guidance_
+
+- Bind every message to a session identifier and a round number; that is what
+  stops cross-session replay.
+- Do not invent a handshake if an existing authenticated channel can be required
+  instead — but then document that requirement loudly.
+- The cross-session replay test is the one most likely to find a real bug.
+
+#### feat(signers): asynchronous approval signer for human-in-the-loop custody
+
+A signer whose `Sign` can return a pending state, with a handle to resume when
+an out-of-band approval completes, rather than blocking a request for minutes.
+
+**Why this matters:** Fireblocks, Turnkey and any policy desk may take minutes
+or hours to approve. The `Signer` contract is synchronous, so the only options
+today are to block a goroutine for an hour or to lose the request; neither is
+viable in a server handling other traffic.
+
+_Acceptance criteria_
+
+- A pending result carries a durable handle that survives process restart.
+- Resuming with a handle returns the signature or a terminal rejection, and
+  never a silently different payload.
+- The payload is bound to the handle so an approval cannot be redirected to
+  another entry, proved by a test.
+- The existing synchronous `Signer` contract is unchanged for signers that do
+  not need this.
+
+_Implementation guidance_
+
+- The payload binding is the security property: an approval for entry A must be
+  unusable for entry B.
+- Do not change the `Signer` interface; add a capability a signer can also
+  implement, which `signer_cache.go` and `hooks.go` already suggest as a
+  pattern.
+- State the durability requirement on the handle store rather than assuming a
+  database.
+
+#### feat(signers): circuit breaker and health checking for remote signers
+
+Track a remote signer's recent failures, open a breaker when it is unhealthy,
+and report health so a chain can route around it before a request fails.
+
+**Why this matters:** #330-era retry and backoff makes one call more likely to
+succeed; it does nothing about a signer that is simply down, where every request
+pays the full retry budget before failing. `chain.go` has fallback but no notion
+of health, so it only learns a signer is dead by failing on it each time.
+
+_Acceptance criteria_
+
+- A breaker opens after a configured failure pattern and short-circuits
+  subsequent calls.
+- Health is observable, and `chain.go` can prefer a healthy signer.
+- A half-open probe recovers automatically when the signer returns.
+- A breaker never converts a refusal-to-sign into a retryable failure, asserted
+  by a test.
+
+_Implementation guidance_
+
+- Distinguish a transport failure from a deliberate refusal; conflating them
+  would retry a policy decision.
+- Read `chain.go` for the existing fallback and quorum semantics before adding
+  routing.
+- Keep the breaker's state per signer identity, not per process-wide signer
+  type.
+
+#### feat(signers): per-signer observability through the hooks interface
+
+Emit latency, outcome and retry counts per signer identity through the existing
+hooks, with a reference dashboard panel.
+
+**Why this matters:** `hooks.go` provides metrics and tracing hooks for the
+library's operations, but a deployment with a KMS signer, a passkey signer and a
+remote signer cannot tell which one is slow or failing. That is the first
+question during an incident and it currently has no instrumentation.
+
+_Acceptance criteria_
+
+- Latency and outcome are recorded per signer identity, not aggregated across
+  signers.
+- Retry and breaker events are distinguishable from first-attempt failures.
+- No address, payload or signature is used as a metric label.
+- The reference dashboard gains a panel and a test asserts the metric names are
+  stable.
+
+_Implementation guidance_
+
+- Unbounded label values are the classic mistake here: addresses must never
+  become labels.
+- Extend the existing hooks rather than adding a second instrumentation path.
+- The name-stability test is what keeps dashboards from breaking silently.
+
+#### feat(signers): verify a KMS key is non-exportable before trusting it
+
+Query each KMS for the key's origin and exportability at construction time and
+refuse, or warn loudly, when the key material could have left the HSM.
+
+**Why this matters:** The reason to use a KMS signer is that the key never
+leaves the service, but both adapters accept any key identifier, including an
+imported key whose material exists elsewhere. The adapter therefore cannot
+deliver the property it is chosen for, and the caller has no way to tell.
+
+_Acceptance criteria_
+
+- Construction checks the key's origin and protection level through the
+  provider's API.
+- A key that does not meet the configured requirement is refused by default.
+- The requirement can be relaxed explicitly, and doing so is recorded.
+- Tests cover an HSM-backed key, an imported key and a key whose metadata cannot
+  be read.
+
+_Implementation guidance_
+
+- Read each provider's field names from their API documentation and cite them;
+  do not guess.
+- Fail closed: unknown metadata should be refused rather than assumed
+  acceptable.
+- One extra call at construction is acceptable; do not add one per signature.
+
+#### feat(signers): enforce user verification and credential backup policy for passkeys
+
+Let a caller require user verification and reject or flag synced,
+backup-eligible credentials, enforced when an assertion is parsed.
+
+**Why this matters:** `webauthn.go` parses assertions, but the UV, BE and BS
+flags carry the difference between a hardware-bound credential and one synced
+through a consumer cloud account. For an account that moves money, that
+distinction is the whole security model, and nothing enforces it today.
+
+_Acceptance criteria_
+
+- A policy can require user verification and an assertion without it is refused.
+- Backup-eligible and backed-up credentials are distinguishable and can be
+  refused.
+- The default is documented explicitly rather than implied.
+- Tests cover each flag combination, including a UV-absent assertion.
+
+_Implementation guidance_
+
+- Read the flag semantics from the WebAuthn specification and cite the section;
+  BE and BS are easy to invert.
+- Enforce at parse time so no caller can accidentally skip the check.
+- State the trade-off in the docs: requiring hardware-bound credentials loses
+  account recovery.
+
+#### feat(signers): authenticator model allowlist from FIDO metadata
+
+Verify an enrolling authenticator's AAGUID against FIDO Metadata Service data,
+so an account can require specific certified models.
+
+**Why this matters:** #331-era attestation verification proves an attestation
+statement is well formed and signed, not that the authenticator is a model
+anyone trusts. Without metadata, a self-signed software authenticator and a
+certified hardware key are indistinguishable at enrolment, which is when the
+decision matters.
+
+_Acceptance criteria_
+
+- An AAGUID is checked against a pinned metadata snapshot, not fetched live
+  during enrolment.
+- An allowlist and a denylist are both expressible, and an unknown AAGUID has a
+  documented default.
+- The snapshot's provenance and date are recorded, and a stale snapshot is
+  reported.
+- Tests cover an allowed model, a denied model and an unknown AAGUID.
+
+_Implementation guidance_
+
+- Pin a snapshot and commit its digest; fetching metadata during enrolment makes
+  enrolment depend on a third party being up.
+- Default to refusing unknown models for the strict policy and say so, rather
+  than quietly allowing.
+- Do not vendor the whole metadata blob if a digest and a fetch step will do;
+  keep the repository small.
+
+#### feat(signers): assert no signer error or string carries key material
+
+A conformance dimension that drives every signer through its failure paths and
+asserts no error, `String` method or formatted value contains private material.
+
+**Why this matters:** There are now a dozen signers across hardware, cloud and
+remote transports, and each formats its own errors. A wrapped provider error
+that happens to include a key handle, a share or a seed would reach a log, and
+nothing checks for it; the pattern is common enough that it needs a test rather
+than review.
+
+_Acceptance criteria_
+
+- Every signer in the repository runs the check as part of the conformance
+  suite.
+- Failure paths are exercised, not only the happy path.
+- The check covers errors, `String`/`Format` output and any struct printed with
+  `%v`.
+- A deliberately leaky test signer is shown to fail the check.
+
+_Implementation guidance_
+
+- The deliberately leaky signer is what proves the test bites; include it as a
+  fixture and show the failure in the pull request.
+- Seed the check with recognisable sentinel key material so a match is
+  unambiguous.
+- `signertest` already enumerates signers for conformance — extend it rather
+  than writing a separate audit.
+
+#### feat(signers): batch ed25519 verification for large signature sets
+
+Verify many ed25519 signatures together rather than one at a time, where the
+batch API is faster, behind an identical-result guarantee.
+
+**Why this matters:** `batch.go` and the verification engine check signatures in
+a loop, which dominates the cost of verifying thousands of entries. Batch
+verification is substantially faster, but it has different failure semantics — a
+batch fails as a whole — so it needs a careful API rather than a drop-in swap.
+
+_Acceptance criteria_
+
+- A batch path exists and is measurably faster, with a committed benchmark
+  showing the crossover point.
+- A batch containing one bad signature identifies which one, by falling back
+  rather than failing opaquely.
+- Results are identical to the per-signature path for every golden vector.
+- The per-signature path remains the default unless the caller opts in.
+
+_Implementation guidance_
+
+- The identical-results property is non-negotiable; a differential test against
+  the existing path is the way to prove it.
+- Report the crossover honestly: below some batch size this is slower, and the
+  benchmark should say so.
+- Do not weaken verification to gain speed; a batch that cannot attribute a
+  failure must fall back.
+
+#### feat(signers): allocate a timeout budget across a delegate tree
+
+Given one deadline for signing a whole tree, divide it across the nodes to be
+signed so a slow signer cannot consume the entire budget.
+
+**Why this matters:** Every signing call takes a context, and the deadline is
+passed down unchanged, so the first slow signer in a ten-delegate tree can
+exhaust the deadline and leave the rest unattempted. The caller then sees a
+timeout without knowing the tree was only partly tried.
+
+_Acceptance criteria_
+
+- A whole-tree deadline is divided across nodes, with the policy documented.
+- Exhausting the budget reports which nodes were not attempted.
+- No partial entry is returned on a timeout, consistent with the existing
+  no-partial-result rule.
+- Tests cover one slow signer, all signers slow, and a deadline already expired
+  on entry.
+
+_Implementation guidance_
+
+- Read `planner.go` for the existing traversal order before imposing a budget on
+  it.
+- The no-partial-result rule is a hard constraint — a timeout must leave the
+  caller's entry untouched.
+- Equal division is a fine first policy; document it as a choice rather than
+  presenting it as optimal.
+
+#### feat(signers): air-gapped signing exchange over files
+
+A documented file format and commands to carry a signing request to an offline
+machine and bring the signature back, with the payload bound into both files.
+
+**Why this matters:** The strongest custody story is a machine that has never
+been on a network, and it is unreachable today: every signer assumes a live
+transport. A file exchange is the only mechanism that works across an air gap,
+and inventing it ad hoc per operator is how payload-substitution mistakes
+happen.
+
+_Acceptance criteria_
+
+- A request file carries everything an offline signer needs, including the full
+  preimage.
+- A response file is bound to the request, so a signature cannot be applied to a
+  different entry.
+- The offline side needs no network and no state from the online side beyond the
+  file.
+- Tests cover a mismatched response, a truncated file and a response reused
+  against another request.
+
+_Implementation guidance_
+
+- Bind by payload hash and check it on the way back in; that single check
+  prevents the main attack.
+- Reuse the `remote/protocol.go` message shapes where they fit rather than
+  designing a third format.
+- Keep the format readable enough that an operator can inspect it before
+  signing.
+
+#### feat(signers): construct any signer from a configuration URI
+
+Build a signer from a single string such as `awskms://...` or `vault://...`,
+with a registry so adapters can register their own scheme.
+
+**Why this matters:** A service that needs to switch custody backends by
+configuration currently has to compile in every adapter and write a selection
+switch. That is the main reason the adapters sit unused in deployments that
+would otherwise benefit from them.
+
+_Acceptance criteria_
+
+- A URI selects and configures a signer, with a registry for out-of-tree
+  schemes.
+- No secret is ever accepted inside the URI, and a URI containing one is
+  refused.
+- An unknown scheme fails with a message listing the registered ones.
+- Tests cover every in-tree scheme and a URI carrying a secret.
+
+_Implementation guidance_
+
+- Refusing secrets in the URI is the important rule: URIs end up in logs,
+  process lists and crash reports.
+- Adapters are separate modules, so registration must be explicit rather than by
+  import side effect from the root package.
+- Mirror the CLI's existing `--secret-env` discipline: name the variable, never
+  the value.
+
+### `area:testing`
+
+#### test: mutation score gate with a committed baseline
+
+Run the mutation suite in CI against a committed score per package and fail when
+the score drops.
+
+**Why this matters:** The `mutation/` module exists and mutation testing is the
+stronger signal than coverage, as the coverage floors themselves say. Run by
+hand it tells nobody anything over time: a test deleted today lowers the score
+and no one finds out.
+
+_Acceptance criteria_
+
+- A baseline score per package is committed with the measurement that produced
+  it.
+- CI fails when a score drops, and the job names the surviving mutants.
+- Raising a baseline requires the same commit as the tests that earned it.
+- The run is bounded in time, with its scope documented if it cannot cover
+  everything.
+
+_Implementation guidance_
+
+- Mutation runs are slow — scope to the signing path first and schedule the
+  rest, saying so explicitly.
+- Follow `scripts/checkcov`'s shape: a committed baseline file and a checker, so
+  this stays consistent with the coverage gate.
+- Never lower a baseline to go green; that is the same rule the coverage floors
+  already carry.
+
+#### test: fuzz across the C ABI boundary
+
+A fuzz target that drives the exported C functions with arbitrary bytes and
+asserts no crash, no hang and no memory error.
+
+**Why this matters:** Every binding reaches the library through these 11
+exported functions, and all of the fuzzing to date runs against Go APIs
+directly. The boundary itself — pointer handling, length arguments, string
+ownership — is the part no fuzzer currently touches, and it is the part where a
+mistake is a segfault in someone else's process.
+
+_Acceptance criteria_
+
+- Arbitrary input to each exported function produces an error, never a crash or
+  a hang.
+- The target runs under a sanitizer so a memory error fails rather than passing
+  silently.
+- Findings are minimised and added to a permanent regression corpus.
+- The target runs in CI for a bounded time and on the nightly schedule for
+  longer.
+
+_Implementation guidance_
+
+- A Go fuzzer alone will not catch the C-side memory errors; a sanitizer build
+  is what makes this worth doing.
+- Cover length and pointer arguments deliberately, including zero and mismatched
+  lengths.
+- `fuzz.yml` already files issues from scheduled runs — reuse it.
+
+#### test: fuzz the verification service's request handlers
+
+Fuzz each HTTP handler with arbitrary bodies, headers and paths, asserting it
+always answers and never panics.
+
+**Why this matters:** `server/` is the component explicitly built for untrusted
+input, and it is the one with no fuzzing. `hardening_test.go` covers the cases
+someone thought of; a handler panic in a shared service is an availability bug
+for every caller.
+
+_Acceptance criteria_
+
+- Every route is fuzzed, including malformed bodies, wrong content types and
+  oversized headers.
+- A panic in any handler fails the target.
+- The service always returns a response, and a fuzz-found hang fails the run.
+- Findings become permanent regression cases.
+
+_Implementation guidance_
+
+- `httptest` keeps this in-process and fast; no network is needed.
+- Assert on the invariant 'always answers, never panics' rather than on specific
+  status codes.
+- Include the authenticated routes with a valid credential so the fuzzer gets
+  past the door.
+
+#### test: fuzz WebAuthn assertion and attestation parsing
+
+Fuzz the assertion and attestation parsers, including the CBOR decoder, over
+arbitrary input.
+
+**Why this matters:** These parsers consume data that arrives straight from a
+browser or an authenticator, which is the most hostile input the library
+accepts. Hand-written CBOR parsing is a classic source of out-of-range and
+allocation bugs, and `attestation_cbor.go` is not fuzzed at all.
+
+_Acceptance criteria_
+
+- Arbitrary bytes produce an error, never a panic, for every parser.
+- A deeply nested or huge CBOR structure is refused rather than exhausting
+  memory.
+- Findings are minimised into a committed corpus.
+- The decode bounds applied are the documented ones, not ad hoc limits.
+
+_Implementation guidance_
+
+- Nesting and length-prefix abuse are the two shapes to seed deliberately.
+- Reuse `internal/decodepolicy` for the bounds so all untrusted decoding shares
+  one policy.
+- Seed the corpus from real assertions in the existing tests so the fuzzer
+  starts from valid structures.
+
+#### test: a fuzz target for every public decode entry point, enforced
+
+Enumerate every exported function that decodes untrusted input and fail the
+build when one has no fuzz target.
+
+**Why this matters:** Fuzzing has been added one target at a time, so coverage
+of the untrusted surface is now a matter of who remembered. A new decoder added
+without a target is invisible, and `internal/doccheck` already shows this
+repository prefers an enforcing test over a convention.
+
+_Acceptance criteria_
+
+- The enumeration is derived from the code, not a hand-maintained list.
+- A new decoding entry point with no fuzz target fails the build.
+- An exemption is possible but must carry a stated reason in the source.
+- The existing targets satisfy the check without modification.
+
+_Implementation guidance_
+
+- `internal/doccheck` is the model for an enforcing meta-test; follow its
+  structure.
+- Define 'decodes untrusted input' precisely in the test's doc comment, since
+  that definition is the whole check.
+- Exemptions need reasons in code, as the coverage floors and the cilocal
+  manifest both do.
+
+#### test: property test that the canonical form is idempotent
+
+Property tests asserting that canonicalising twice changes nothing, and that
+semantically equal entries canonicalise identically regardless of construction
+order.
+
+**Why this matters:** `canonical.go` underpins `Equal`, the JSON representation
+and any fingerprint built on it. If canonicalisation is not idempotent or
+depends on how an entry was assembled, every one of those silently compares the
+wrong things, and only a property test over generated entries will find it.
+
+_Acceptance criteria_
+
+- Canonicalising an already-canonical entry is a no-op, over generated entries.
+- Two entries built in different orders that are semantically equal canonicalise
+  to identical bytes.
+- Delegate trees of varying shape and depth are generated, not just flat ones.
+- A counterexample is minimised and committed as a regression case.
+
+_Implementation guidance_
+
+- Reuse the existing delegate-tree generators from the property tests rather
+  than writing new ones.
+- Order independence is the property most likely to be violated; weight
+  generation toward reordering.
+- If a counterexample appears, fix the code — do not weaken the property.
+
+#### test: property test that the planner only emits valid delegate trees
+
+Generate planner inputs and assert every tree it produces passes
+`ValidateDelegateOrder` and the duplicate rules.
+
+**Why this matters:** `planner.go` constructs delegate trees and
+`ValidateDelegateOrder` is what the signing path enforces. Nothing currently
+proves the planner cannot produce a tree the signer will then reject, which
+would be an internally inconsistent library failing at the last step.
+
+_Acceptance criteria_
+
+- Every generated plan yields a tree that validates.
+- Generation includes duplicate addresses across levels, which the CAP permits,
+  and within a level, which it does not.
+- An input the planner cannot satisfy produces an error rather than an invalid
+  tree.
+- Counterexamples are committed as regression cases.
+
+_Implementation guidance_
+
+- The same address at different levels is legal; within one level it is not.
+  Generate both deliberately.
+- Sort by the XDR bytes of the address, as the CAP requires and the library
+  already does.
+- A planner that errors is acceptable; one that emits an invalid tree is the
+  bug.
+
+#### test: property test that the risk analyzer is deterministic
+
+Assert the analyzer returns identical findings for the same entry across runs
+and regardless of the order in which equivalent structures were built.
+
+**Why this matters:** The analyzer's findings reach the CLI, the browser
+extension and any service exposing it. A finding that appears only sometimes, or
+depends on map iteration order, would be worse than no analyzer: a clean result
+would be unreliable in a way nobody could reproduce.
+
+_Acceptance criteria_
+
+- Repeated analysis of one entry yields identical findings in identical order.
+- Equivalent entries built differently yield the same findings.
+- Findings are stably ordered, with the ordering documented.
+- Map iteration is shown not to affect output.
+
+_Implementation guidance_
+
+- Go randomises map iteration, which is the most likely source of instability —
+  run the property many times.
+- Sort findings explicitly rather than relying on traversal order.
+- Keep the finding identifiers stable; consumers match on them.
+
+#### test: continuous benchmarking with a published history
+
+Record benchmark results per commit on main, publish the series, and flag a
+regression against the trend rather than a single threshold.
+
+**Why this matters:** `scripts/checkbench` gates against a threshold, which
+catches a cliff but not a steady drift. The signing path has lost a few per cent
+at a time before, and without a history nobody can tell when it started or which
+change did it.
+
+_Acceptance criteria_
+
+- Results are recorded per commit on main and published where they can be read
+  over time.
+- A regression against the recent trend is flagged, distinctly from the existing
+  threshold gate.
+- Runner variance is accounted for, with the method stated.
+- The series survives a rerun of the same commit without appearing to change.
+
+_Implementation guidance_
+
+- Noise is the whole difficulty: say how it is handled rather than treating
+  every bump as a regression.
+- Reuse `checkbench`'s parsing rather than writing a second benchmark reader.
+- Keep the threshold gate; this is an addition for drift, not a replacement.
+
+#### test: allocation budget for every public API call
+
+Assert a committed allocation count per public operation and fail when one
+grows.
+
+**Why this matters:** Allocations have already been reduced once in the
+deep-copy path, and nothing stops them coming back. The deep-copy-on-every-call
+rule makes this library allocation-heavy by design, so allocation count is the
+metric that matters for a server signing thousands of entries.
+
+_Acceptance criteria_
+
+- A committed budget per operation, with the measurement that set it.
+- CI fails when an operation exceeds its budget.
+- Lowering a budget is a normal change; raising one needs a stated reason in the
+  commit.
+- The budgets cover each credential arm separately.
+
+_Implementation guidance_
+
+- `testing.AllocsPerRun` or the benchmark's alloc counters give stable numbers;
+  pick one and be consistent.
+- Per-arm budgets matter: the delegates arm legitimately allocates more.
+- Follow the coverage floors' convention of a reason recorded beside each
+  number.
+
+#### test: fault injection for remote and KMS signers
+
+A harness that injects timeouts, partial responses, connection resets and
+malformed payloads into every network-backed signer and asserts correct
+behaviour.
+
+**Why this matters:** Every remote signer is tested against a well-behaved fake,
+so they are proved to work when nothing goes wrong. The failures that matter in
+production — a truncated response, a reset mid-read — are exactly what no test
+produces, and the no-partial-result rule is most likely to break there.
+
+_Acceptance criteria_
+
+- Each network-backed signer is driven through timeout, reset, partial response
+  and malformed payload.
+- No injected failure produces a partial result or a non-terminal error
+  misreported as terminal.
+- Retry and breaker behaviour is asserted, not just the final error.
+- The harness is reusable so a new signer inherits the cases.
+
+_Implementation guidance_
+
+- Make it a conformance dimension in `signertest` so new signers get it
+  automatically.
+- A truncated-but-parseable response is the nastiest case; include it
+  explicitly.
+- Assert the no-partial-result invariant on every path, since that is the
+  library's standing rule.
+
+#### test: run the whole suite under the race detector in CI
+
+A CI job that runs the full test suite with `-race`, with its runtime bounded
+and its scope stated.
+
+**Why this matters:** There is concurrency in batch signing, the signer cache,
+the nonce tracker and the coordinator, and `-race` is run ad hoc at best. A data
+race in the nonce tracker is a correctness bug in a replay guard, which is not
+something to discover from production behaviour.
+
+_Acceptance criteria_
+
+- The full suite runs with `-race` in CI and failures block the merge.
+- The job's runtime is bounded, and any excluded package is named with a reason.
+- At least one existing concurrent path is confirmed covered by the job.
+- A deliberately racy test is shown to fail the job, then removed.
+
+_Implementation guidance_
+
+- `-race` is several times slower; schedule it or parallelise rather than making
+  every pull request wait.
+- Show the deliberate race failing in the pull request, as the golden-vector
+  gate does, then revert it.
+- Name exclusions explicitly; a silently skipped package makes the job
+  misleading.
+
+#### test: detect and quarantine flaky tests
+
+Re-run failures to identify flakes, record them in a tracked list, and report
+the flake rate rather than letting a rerun hide it.
+
+**Why this matters:** This repository has already been bitten by intermittent
+failures — the macOS binding crash in #518 passes about one run in five. An
+unmanaged flake trains everyone to rerun CI, which is how a real intermittent
+bug gets ignored for months.
+
+_Acceptance criteria_
+
+- A failure that passes on rerun is recorded as a flake rather than silently
+  passing.
+- Flake rates are reported per test over time.
+- A test exceeding a threshold is quarantined with a tracking issue, not
+  deleted.
+- Quarantine is visible in the run summary so it cannot be forgotten.
+
+_Implementation guidance_
+
+- Never auto-retry without recording: a silent retry is how flakes become
+  permanent.
+- A quarantined test still runs and still reports; it just does not block.
+- #518 is the obvious first entry and a good test of the mechanism.
+
+#### test: coverage floors for error paths specifically
+
+Measure coverage of error-returning branches separately from overall statement
+coverage, with its own floors.
+
+**Why this matters:** The per-package floors are satisfied largely by happy
+paths, which is normal and also the opposite of what matters here: this
+library's value is in refusing correctly. A package can sit at 85% with most of
+its error branches never executed.
+
+_Acceptance criteria_
+
+- Error-path coverage is measured and reported separately from statement
+  coverage.
+- Floors are set per package from a measurement, with reasons recorded.
+- The signing path carries a strictly higher error-path floor than the rest.
+- The checker explains which error branches are uncovered, not just a number.
+
+_Implementation guidance_
+
+- Extend `scripts/checkcov` rather than adding a second tool; it already owns
+  the floors file.
+- Define the metric precisely in the doc comment — 'error path' needs to mean
+  one thing.
+- Naming the uncovered branches is what makes this actionable rather than
+  another number to satisfy.
+
+#### test: minimise the fuzz corpus and keep a permanent regression set
+
+Minimise each fuzz corpus, keep every historical finding as a permanent
+regression case, and separate the two in CI.
+
+**Why this matters:** Corpora grow until the fuzz job spends its budget
+re-executing near-duplicates, which quietly reduces fuzzing to a slow unit-test
+run. Separately, a minimised input that once found a real bug must never be
+dropped, and nothing distinguishes those today.
+
+_Acceptance criteria_
+
+- Each corpus is minimised and the reduction is reported.
+- Every historical finding is kept in a regression set that always runs,
+  separate from the exploration corpus.
+- Minimisation cannot drop a regression case, asserted by a test.
+- The fuzz job runs the regression set first, before exploring.
+
+_Implementation guidance_
+
+- `cmd/gencorpus` already builds corpora; extend it rather than adding another
+  tool.
+- The regression set is sacred: it is the only record that a class of bug
+  existed.
+- Report the before and after sizes so the benefit is visible.
+
+#### test: snapshot tests for the tree renderer and the TUI
+
+Golden-file snapshots of the renderer's and TUI's output for a set of entries,
+including wide and deep trees.
+
+**Why this matters:** `treerender.go` and `tui.go` are how a human decides
+whether to sign, so their output is a security surface: a truncated or
+misaligned delegate tree can hide a node. They are currently checked, if at all,
+by reading them, which is the one method that does not survive a refactor.
+
+_Acceptance criteria_
+
+- Snapshots cover a flat tree, a deep tree, a wide tree and one with duplicate
+  addresses across levels.
+- A rendering change fails the test and shows a readable diff.
+- Snapshots are regenerated by a documented command, never edited by hand.
+- Output is asserted to contain every address in the entry, so nothing can be
+  silently omitted.
+
+_Implementation guidance_
+
+- The 'every address appears' assertion is the one with security value — write
+  it as a property, not just a snapshot.
+- Keep snapshots small enough to review in a diff.
+- Follow the golden-vector rule: a snapshot is regenerated, never hand-edited.
+
+#### test: generate golden vectors across several JS SDK versions
+
+Generate the vector set under more than one pinned `@stellar/stellar-sdk`
+version and assert the bytes agree.
+
+**Why this matters:** The vectors are the correctness gate and they come from
+exactly one pinned version, so a change in the reference implementation is
+indistinguishable from a change in ours. Agreement across two versions is what
+tells us the bytes are protocol-defined rather than an artefact of one release.
+
+_Acceptance criteria_
+
+- Vectors are generated under at least two pinned versions and compared byte for
+  byte.
+- A disagreement fails loudly and is reported rather than resolved by picking
+  one.
+- Each version is pinned exactly, with its lockfile committed.
+- The generator still refuses to run on an unpinned version.
+
+_Implementation guidance_
+
+- A disagreement is a finding to report, not a vector to edit — the standing
+  rule is that vectors are never hand-edited.
+- Keep the current pin as the primary and add the second as a cross-check, so
+  the gate does not get weaker.
+- The CI drift check must cover both generations.
+
+#### test: rehearse a protocol upgrade against the next host version
+
+Run the e2e scenarios against a local host built for the next protocol version,
+so an upgrade's effect on existing entries is known before the network votes.
+
+**Why this matters:** Protocol 28 arrived during this project and the library's
+compatibility was established after the fact. The next upgrade will be the same
+unless entries are tested against the new host beforehand, and the local
+quickstart makes that possible without waiting for a public network.
+
+_Acceptance criteria_
+
+- The scenarios run against a host image for the next protocol version.
+- A behaviour change is reported per scenario, with the raw host error.
+- The job is scheduled or manual and does not block pull requests.
+- Results are recorded with the host version and date.
+
+_Implementation guidance_
+
+- The local quickstart harness already exists; reuse it rather than standing up
+  another environment.
+- Report rather than adapt: a behaviour change needs a human decision, not an
+  automatic fix.
+- Record the image digest, since 'next version' moves.
+
+### `area:tooling`
+
+#### chore: custom linters for the repository's own invariants
+
+Analyzers that enforce the rules this repository states in prose: no mutation of
+caller input, no logging in library code, no `panic` outside tests, no
+`math/rand`, no floats.
+
+**Why this matters:** These rules are in CLAUDE.md and the coding standards, and
+they are currently enforced by review. Review has already missed each of them at
+least once; the no-mutation rule in particular is invisible in a diff because it
+looks like ordinary field assignment on a struct the caller still owns.
+
+_Acceptance criteria_
+
+- An analyzer exists per rule and runs in CI.
+- Each analyzer is tested with a violating and a compliant fixture.
+- A violation fails the build with the file, line and the rule's rationale.
+- Exemptions require a directive with a stated reason in the source.
+
+_Implementation guidance_
+
+- `golang.org/x/tools/go/analysis` is the framework and needs no new direct
+  dependency beyond the tools module.
+- `internal/doccheck` is the precedent for enforcing a repository convention
+  with a test.
+- Start with no-logging and no-panic, which are mechanical; the no-mutation rule
+  is the hard one and may need the deep-copy call as its signal.
+
+#### chore: branch protection and rulesets as code with drift detection
+
+Keep the required checks, review requirements and bypass actors in a committed
+file, and fail a scheduled job when the live configuration differs.
+
+**Why this matters:** The required checks and the bypass list are security
+configuration that currently lives only in the GitHub UI, where a change leaves
+no trace in the repository. A merge-queue app holding a permanent bypass, or a
+required check quietly removed, would be invisible in review — and this
+repository has already had both questions come up.
+
+_Acceptance criteria_
+
+- The intended configuration is committed and human-readable.
+- A scheduled job compares live against committed and reports any difference.
+- Bypass actors are part of the comparison, not just the check list.
+- A deliberate drift is shown to be detected, then reverted.
+
+_Implementation guidance_
+
+- Report rather than auto-apply: a job that rewrites protection rules is itself
+  a risk.
+- Include both repositories in the organisation so the comparison is complete.
+- Show the detection working in the pull request, as the golden-vector gate
+  does.
+
+#### ci: secret scanning across the full history
+
+Scan every pull request and the whole history for committed credentials, with an
+allowlist for the repository's deterministic test keys.
+
+**Why this matters:** The repository derives test keys from public labels
+deliberately, so a naive scanner reports them on every run and gets ignored,
+which is worse than not running it. A real key committed once stays in the
+history even after a revert, so a history scan is the only way to know the
+repository is clean.
+
+_Acceptance criteria_
+
+- Pull requests and the full history are both scanned.
+- The deterministic test keys are allowlisted by their derivation, not by
+  pattern.
+- A finding fails the run and names the commit and file.
+- The allowlist is documented so nobody widens it casually.
+
+_Implementation guidance_
+
+- The allowlist design is the whole difficulty: too broad and it hides a real
+  key.
+- The test keys come from `sha256(label)` — allowlist by that construction
+  rather than by matching key-shaped strings.
+- A history scan runs once on a schedule, not per pull request.
+
+#### ci: advisory scanning across every ecosystem the repository ships
+
+Scan Go, npm, Rust, Python and Maven dependencies against advisory databases on
+every pull request and on a schedule.
+
+**Why this matters:** Dependency review covers the Go module's graph. The
+repository now ships five language bindings, each with its own lockfile and its
+own dependency tree, and none of those are scanned. A vulnerable transitive
+dependency in the Node or Python binding reaches users through a published
+package.
+
+_Acceptance criteria_
+
+- Every committed lockfile is scanned, and a new lockfile with no scan coverage
+  fails the build.
+- Findings are reported with severity and the path to the dependency.
+- The scheduled run covers published artifacts, not only the source tree.
+- A scanner failure is reported rather than treated as a pass.
+
+_Implementation guidance_
+
+- The enforcing check — a lockfile with no scanner — is what keeps this complete
+  as bindings are added.
+- `osv-scanner` handles most of these ecosystems in one pass.
+- Never let a scanner error exit zero; that is how scanning quietly stops.
+
+#### chore: license inventory across every ecosystem
+
+Produce a license inventory for all five bindings and the Go module, fail on a
+license outside an allowed set, and publish the inventory with each release.
+
+**Why this matters:** The project is Apache-2.0 and consumers with a compliance
+process need to know what they are pulling in transitively. With five ecosystems
+there is no single command that answers this, and a copyleft transitive
+dependency in one binding would be found by a consumer's audit rather than ours.
+
+_Acceptance criteria_
+
+- An inventory is generated per ecosystem and combined into one document.
+- A license outside the allowed set fails the build and names the dependency.
+- The allowed set is committed with its rationale.
+- The inventory is published with each release.
+
+_Implementation guidance_
+
+- Decide the allowed set deliberately and write down why; an arbitrary list
+  causes arguments later.
+- An unknown or missing license must fail rather than pass, since unknown is the
+  common case for small packages.
+- This pairs with the SBOM work; share the generation where possible.
+
+#### ci: bring the pipeline's runtime within a stated budget
+
+Measure the pull-request pipeline's critical path, restructure the job graph to
+fit a stated budget, and fail when a change pushes it over.
+
+**Why this matters:** There are two dozen workflows now, and the cost report
+shows where the minutes go but nothing bounds them. A slow pipeline gets worked
+around rather than waited for, which is how a red check gets merged past — the
+failure mode this repository has already had.
+
+_Acceptance criteria_
+
+- The critical path is measured and published.
+- A stated budget is enforced and a change exceeding it fails with an
+  explanation.
+- Advisory and path-filtered workflows are excluded from the budget and that
+  exclusion is explicit.
+- No check is removed or weakened to meet the budget.
+
+_Implementation guidance_
+
+- `cost-report.yml` already gathers per-workflow duration; build on it rather
+  than measuring again.
+- The last criterion is the important one: this must not become an excuse to
+  delete coverage.
+- Parallelism and caching are the levers; `scripts/cilocal`'s manifest already
+  describes what each job needs.
+
+#### feat(cmd): Windows support for the CLI, built and smoke-tested
+
+Build and test the CLI on Windows, fixing the path, console and shell
+assumptions that break there, with a smoke test in CI.
+
+**Why this matters:** `scripts/cilocal` already carries Windows-specific logic
+for finding bash, and Wave 11's contributor ran their verification on a Windows
+host, so Windows developers are already here. The CLI is not built or tested
+there, so whether it works at all is unknown, and the completion and exec-signer
+paths are the obvious suspects.
+
+_Acceptance criteria_
+
+- The CLI builds for Windows in CI and a smoke test runs every subcommand.
+- Path handling, line endings and the exec-based signer work or are documented
+  as unsupported with a reason.
+- The release publishes a Windows binary, or the documentation states plainly
+  that it does not.
+- Shell completions either work on PowerShell or are documented as unavailable.
+
+_Implementation guidance_
+
+- Decide and state the support level first; a half-supported platform is worse
+  than a documented unsupported one.
+- The exec-signer and completion tests are where this will fail; look there
+  before assuming it works.
+- The bindings' dlopen-based loading is explicitly Linux and macOS only — do not
+  imply Windows support for those.
+
+#### ci: a pre-release channel with a canary install path
+
+Publish pre-release versions from a tag suffix to every channel, so a release
+can be exercised by real consumers before it becomes current.
+
+**Why this matters:** The release pipeline publishes to a container registry,
+npm and a docs site in one step, and the first consumer of a mistake is
+everyone. A pre-release channel lets a version be installed deliberately without
+becoming the default for anyone who does not ask for it.
+
+_Acceptance criteria_
+
+- A pre-release tag publishes to every channel without moving any 'latest'
+  pointer.
+- The documented install commands for the pre-release channel are tested in CI.
+- A pre-release is clearly marked in every channel's metadata.
+- Promotion to a full release does not rebuild the artifacts.
+
+_Implementation guidance_
+
+- Not moving 'latest' is the property that matters; verify it per channel rather
+  than assuming.
+- Promoting without rebuilding keeps the reproducibility and provenance claims
+  intact.
+- Follow the existing tag-guard pattern so a pre-release cannot be published
+  from an untagged commit.
+
+#### ci: aggregate every scanner's output into code scanning
+
+Have every analysis job emit SARIF and upload it, so findings appear in one
+place with history rather than in job logs.
+
+**Why this matters:** CodeQL reports into code scanning; the supply-chain scan,
+the custom linters and the advisory scanners each print to a job log that nobody
+reads unless it fails. A finding that does not block a merge is effectively
+invisible, which is the wrong outcome for a warning-level security finding.
+
+_Acceptance criteria_
+
+- Each analysis job emits SARIF and uploads it.
+- Findings carry a stable rule identifier so they can be tracked across runs.
+- A warning appears in code scanning without failing the build; a blocking
+  finding still fails it.
+- The upload failing is itself reported.
+
+_Implementation guidance_
+
+- `scripts/supply-chain-scan.sh` already separates blocking from warning
+  severities — map that distinction onto SARIF levels.
+- Stable rule identifiers are what make history useful; assign them
+  deliberately.
+- Keep the human-readable output too; the SARIF is an addition.
+
+#### ci: a release dry run that exercises the whole pipeline
+
+A manually triggered run that performs every release step against throwaway
+destinations, so the pipeline is proved before a real tag.
+
+**Why this matters:** `release.yml` is the longest and least-exercised workflow,
+and it only ever runs on a real tag, which means its failures are discovered
+mid-release. This repository has already found a release step that had never
+succeeded — the tool-version step that exited 127 on every tag.
+
+_Acceptance criteria_
+
+- Every step runs, including the publish steps, against throwaway destinations.
+- The dry run cannot write to any real registry, repository or release.
+- A step that cannot be dry-run is named, with its reason.
+- The dry run is part of the release checklist.
+
+_Implementation guidance_
+
+- Enforce the throwaway destinations structurally, not by convention — a dry run
+  that publishes for real is the failure to design out.
+- Naming the un-dry-runnable steps is valuable on its own.
+- The existing release checklist is where this belongs; wire it in rather than
+  leaving it optional.
+
+#### chore: version the documentation site per release
+
+Publish a versioned copy of the documentation per release alongside the current
+one, with a switcher and a canonical URL policy.
+
+**Why this matters:** The site publishes from main, so someone on the released
+version reads documentation for unreleased behaviour. For a library whose
+documentation states protocol semantics and API contracts, that mismatch
+produces confident wrong conclusions.
+
+_Acceptance criteria_
+
+- Each release publishes a versioned copy that remains available.
+- A version switcher is present and the current version is unambiguous.
+- Canonical URLs point at the current release, not at main.
+- Older versions carry a notice that they are not current.
+
+_Implementation guidance_
+
+- `scripts/docsite` already builds the site; this is about publication layout.
+- Decide the retention policy explicitly or the site grows forever.
+- Set canonical tags properly or search results will keep sending people to
+  stale pages.
+
+#### feat(cmd): plugin mechanism for out-of-tree subcommands
+
+Discover and dispatch to external `soroauth-*` executables on PATH, so an
+organisation can add a subcommand without forking.
+
+**Why this matters:** The CLI has accumulated many subcommands and the non-goals
+are explicit about what it will not absorb — key management, wallets, bespoke
+policy. A plugin mechanism is how those stay out of the binary while remaining
+usable, and it is the standard pattern for this.
+
+_Acceptance criteria_
+
+- An external `soroauth-foo` is discoverable and invocable as `soroauth foo`.
+- `--help` lists discovered plugins separately from built-in subcommands.
+- A plugin cannot shadow a built-in subcommand.
+- No secret is passed to a plugin except through the documented
+  environment-variable mechanism.
+
+_Implementation guidance_
+
+- Built-ins must win: shadowing `sign` would be a security problem, so enforce
+  it rather than documenting it.
+- Keep the CLI's existing discipline — never a secret as an argument — across
+  the plugin boundary too.
+- Document the contract so a plugin author knows what is stable.
+
+#### chore: enforce artifact and cache retention policies
+
+Set a deliberate retention per artifact kind, prune caches on a schedule, and
+report storage use.
+
+**Why this matters:** Workflows upload prebuilds, parity reports, coverage data
+and vector artifacts with whatever retention they happened to specify. Beyond
+cost, a long-lived artifact containing a build of untrusted pull-request code is
+a liability nobody is tracking.
+
+_Acceptance criteria_
+
+- Every upload specifies a retention, and one without it fails a check.
+- Caches are pruned on a schedule and storage use is reported.
+- Artifacts from pull-request runs have a shorter retention than those from
+  main.
+- The policy is documented with its reasoning.
+
+_Implementation guidance_
+
+- The enforcing check is the durable part; a one-time cleanup regresses
+  immediately.
+- Reuse `cost-report.yml`'s reporting shape for storage.
+- Treat pull-request artifacts as untrusted and say so in the policy.
+
+#### chore: reconcile filed issues against the committed backlog
+
+A mode that compares a committed backlog against the issues actually filed and
+reports missing, extra, retitled and mislabelled ones.
+
+**Why this matters:** The backlog is committed as the source of truth and the
+issues are filed from it, after which the two drift: an issue gets retitled, a
+label is dropped, a points label disagrees with the backlog. With several
+hundred issues across waves, nobody can check that by hand, and the points total
+is what the programme is measured on.
+
+_Acceptance criteria_
+
+- The reconciliation reports missing, extra, retitled and mislabelled issues.
+- The points total from the labels is compared against the backlog's and any
+  difference is reported.
+- The mode is read-only and changes nothing.
+- It runs against a previous wave and its output is included in the pull
+  request.
+
+_Implementation guidance_
+
+- Read-only by default; an auto-fix that retitles a contributor's issue would be
+  worse than the drift.
+- Match on title first and fall back to the issue body's backlog identifier,
+  since titles are what get edited.
+- `scripts/wave_issues.py` already validates a backlog and skips by title —
+  reuse both.
+
+## Trivial — 100 points each (30 issues)
+
+### `area:api`
+
+#### feat(api): String method for CredentialArm
+
+A `String` method on `CredentialArm` returning its stable identifier, matching
+the values `Inspect` reports.
+
+**Why this matters:** `CredentialArm` is a string type with four constants, and
+the report types already have `String` methods. Formatting an arm with `%v`
+works by accident today, so any future change to the underlying type would
+silently change log and report output.
+
+**Good first issue.** Entry point: `arm.go`.
+
+_Acceptance criteria_
+
+- `String` returns the same identifiers `EntryInfo.CredentialType` uses.
+- An unknown arm returns a clearly-marked unknown value rather than an empty
+  string.
+- A test asserts the method and the inspect report cannot disagree.
+- The method is documented as stable, since consumers match on it.
+
+_Implementation guidance_
+
+- Derive the identifiers from `inspect.go` so the two cannot drift.
+- An empty string for an unknown value is the trap; return something
+  recognisable instead.
+- Follow the existing `String` methods' style on the report types.
+
+#### feat(api): typed constants for the authorized function types
+
+Exported constants for the three authorized function types, mirroring how the
+credential arms are exposed.
+
+**Why this matters:** The arms are exported as a typed vocabulary, but a caller
+branching on the function type has to reach into the SDK's generated enum, whose
+names are doubled and awkward. The repository already decided this vocabulary
+belongs in its own types; the function types were simply not included.
+
+**Good first issue.** Entry point: `arm.go and inspect.go`.
+
+_Acceptance criteria_
+
+- All three types have constants, named consistently with the arm constants.
+- Conversion to and from the SDK's enum is provided and tested round-trip.
+- An unrecognised value produces the existing unsupported-function-type error
+  rather than a zero value.
+- A test fails if the SDK gains a function type with no constant here.
+
+_Implementation guidance_
+
+- Enumerate from the SDK's `xdr` package and cite the file.
+- The completeness test is what keeps this current as the protocol grows.
+- Fail closed on unknown values; the sentinel error for that already exists.
+
+#### feat(api): report whether an entry is fully signed
+
+A helper answering whether every node of an entry that needs a signature has
+one.
+
+**Why this matters:** `Inspect` reports a `Signed` flag per node and the
+documentation tells callers to walk the tree themselves. Everyone writes that
+walk, it is easy to get wrong on a nested delegates tree, and a wrong answer
+means submitting an entry that fails on chain after fees.
+
+**Good first issue.** Entry point: `inspect.go`.
+
+_Acceptance criteria_
+
+- Every node at every depth is considered, including nested delegates.
+- A source-account entry is reported as not requiring a signature rather than as
+  unsigned.
+- An empty `ScvVec` counts as unsigned, consistent with `Inspect`.
+- Tests cover each arm, including a partially-signed delegate tree.
+
+_Implementation guidance_
+
+- Reuse `Inspect`'s report rather than re-walking the XDR, so the two cannot
+  disagree.
+- The source-account case is the one that makes a naive version wrong.
+- Match `Inspect`'s existing definition of signed exactly, including the
+  empty-vector rule.
+
+#### feat(api): expose the library version
+
+An exported constant or function giving the library's version, used by the CLI's
+`--version` rather than only a build-time variable.
+
+**Why this matters:** The CLI reports a version stamped by the linker, so a
+consumer importing the library as a package has no way to report which version
+they are on. Bug reports then arrive without a version, and the bindings have no
+version to pass across the FFI either.
+
+**Good first issue.** Entry point: `doc.go and cmd/soroauth/`.
+
+_Acceptance criteria_
+
+- The version is readable from Go code with no build-time flags.
+- The CLI's `--version` and the library value cannot disagree, asserted by a
+  test.
+- The release process updates it, and a check fails if a tag and the constant
+  diverge.
+- The bindings can report it.
+
+_Implementation guidance_
+
+- A test tying the constant to the tag is what prevents the usual stale-constant
+  problem.
+- The CLI already has `main.version` stamped — reconcile rather than adding a
+  second notion of version.
+- The C ABI's version symbol work is related; keep the two consistent.
+
+### `area:docs`
+
+#### docs: Go doc examples for canonical.go
+
+Runnable `Example` functions for the canonical-form helpers, in the style of the
+existing example files.
+
+**Why this matters:** `canonical.go` underpins `Equal`, the JSON representation
+and the diff tooling, and `pkg.go.dev` shows its signatures with no worked use.
+Canonicalisation is also the kind of operation whose point is unclear from a
+signature alone.
+
+**Good first issue.** Entry point: `canonical.go and inspect_example_test.go`.
+
+_Acceptance criteria_
+
+- At least one example showing two differently-built but equal entries
+  canonicalising identically.
+- Output assertions use real values from a committed golden vector, not invented
+  ones.
+- File-scoped constants, so the file cannot collide with another example file's
+  identifiers.
+- `go test ./...` passes with the examples' output verified.
+
+_Implementation guidance_
+
+- Read `inspect_example_test.go` and follow it exactly; consistency across
+  example files is the point.
+- Run the test to get the real output rather than predicting it — a guessed
+  `// Output:` is the usual failure.
+- Keep each example short enough to read on `pkg.go.dev` without scrolling.
+
+#### docs: Go doc examples for Equal and Clone
+
+Runnable examples for `Equal` and `Clone`, showing the deep-copy guarantee.
+
+**Why this matters:** `Equal` and `Clone` landed after the Wave 9 doc-example
+pass, so they have none. `Clone`'s whole value is that mutating the copy cannot
+affect the original, which an example demonstrates far better than a sentence.
+
+**Good first issue.** Entry point: `equal.go`.
+
+_Acceptance criteria_
+
+- An example mutates a clone and shows the original unchanged.
+- An example shows `Equal` returning false for entries differing only in
+  signature.
+- Values come from a committed golden vector.
+- `go test ./...` passes with output verified.
+
+_Implementation guidance_
+
+- Follow the existing example files' structure exactly.
+- The mutation example is the valuable one — make the unchanged original visible
+  in the output.
+- Use file-scoped constants to avoid identifier collisions.
+
+#### docs: Go doc examples for the nonce tracker
+
+Runnable examples showing a nonce being recorded and a reuse being refused.
+
+**Why this matters:** A replay guard is only useful if callers wire it in, and
+`noncetracker.go` has no example showing where it sits in a signing flow. Its
+API is small enough that the gap is purely documentation.
+
+**Good first issue.** Entry point: `noncetracker.go`.
+
+_Acceptance criteria_
+
+- An example records a nonce and shows a second use refused.
+- The example makes clear the tracker is per-process unless given durable
+  storage.
+- Output assertions are verified by running the test.
+- `go test ./...` passes.
+
+_Implementation guidance_
+
+- Follow the existing example files.
+- State the in-memory limitation in the example's comment; that is the thing
+  people get wrong.
+- Keep it short — this is an illustration, not a tutorial.
+
+#### docs: Go doc examples for the signer chain
+
+Runnable examples for the signer chain's fallback and quorum behaviour.
+
+**Why this matters:** `chain.go` has two distinct behaviours — fallback and
+quorum — and which one a given construction produces is not obvious from the
+signature. That ambiguity is exactly what gets misconfigured, and a chain that
+silently falls back when quorum was intended is a security problem.
+
+**Good first issue.** Entry point: `chain.go`.
+
+_Acceptance criteria_
+
+- One example per behaviour, fallback and quorum.
+- The quorum example shows what happens when quorum is not met.
+- Deterministic test signers are used so the output is stable.
+- `go test ./...` passes with output verified.
+
+_Implementation guidance_
+
+- Derive test keys the repository's way, `keypair.FromRawSeed(sha256(label))`,
+  so output is deterministic.
+- Make the not-met case explicit; that is the behaviour worth documenting.
+- Follow the existing example files' style.
+
+#### docs: Go doc examples for the threshold signer
+
+Runnable examples for the threshold signer interface, showing a successful
+signature and a below-threshold refusal.
+
+**Why this matters:** Threshold signing is the hardest part of the library to
+adopt and has no worked example. The below-threshold case matters most: a caller
+needs to see that it fails cleanly rather than producing a partial signature.
+
+**Good first issue.** Entry point: `threshold.go and frost/frost.go`.
+
+_Acceptance criteria_
+
+- An example produces a signature with enough participants.
+- An example shows a below-threshold attempt refused with no partial result.
+- Fixed test shares so the output is deterministic.
+- `go test ./...` passes with output verified.
+
+_Implementation guidance_
+
+- Keep the share setup in the example minimal; the signing call is the subject.
+- The refusal example is the important one — show that nothing usable comes
+  back.
+- Follow the existing example files.
+
+#### docs: Go doc examples for the policy package
+
+Runnable examples showing a policy allowing and refusing an entry.
+
+**Why this matters:** `policy/` expresses rules as data, which is the right
+design and also the one that needs an example to be usable. Nothing on
+`pkg.go.dev` shows what a rule looks like, so the package is effectively
+undiscoverable.
+
+**Good first issue.** Entry point: `policy/policy.go and policy/rules.go`.
+
+_Acceptance criteria_
+
+- An example constructs a policy and shows an entry allowed and one refused.
+- The refusal names the rule that refused it.
+- Values come from a committed golden vector.
+- `go test ./...` passes with output verified.
+
+_Implementation guidance_
+
+- Pick the simplest real rule for the example rather than demonstrating the
+  whole vocabulary.
+- Show the refusal reason in the output; that is what makes the package usable.
+- Follow the existing example files.
+
+#### docs: document the three authorized function types in one place
+
+A short reference for `ContractFn`, `CreateContractHostFn` and
+`CreateContractV2HostFn`: what each authorizes and how the library reports it.
+
+**Why this matters:** `doc.go` documents the four credential arms in a table,
+which is the single most useful thing in the package documentation. The
+authorized function types get no equivalent treatment although they determine
+what an entry actually permits, and the difference between the two create arms
+is a security-relevant distinction.
+
+**Good first issue.** Entry point: `doc.go and docs/glossary.md`.
+
+_Acceptance criteria_
+
+- All three types are listed with what each authorizes.
+- The difference between the two create arms, including constructor arguments,
+  is stated.
+- The list is derived from the SDK's `xdr` package and cites the file read.
+- A test fails if the SDK gains a function type the document does not mention.
+
+_Implementation guidance_
+
+- Enumerate from the SDK source, not from memory; cite the file.
+- The enforcing test is what keeps this current — `internal/doccheck` is the
+  precedent.
+- Match the style of the credential-arm table already in `doc.go`.
+
+#### docs: document the credential arm constants
+
+Doc comments on each `CredentialArm` constant explaining what the arm is, which
+preimage it uses and whether it is address-bound.
+
+**Why this matters:** `arm.go` exports four constants that are the library's
+central vocabulary, and the per-constant documentation does not say which
+preimage variant each implies. That mapping is the thing a reader most needs and
+currently has to reconstruct from `preimage.go`.
+
+**Good first issue.** Entry point: `arm.go`.
+
+_Acceptance criteria_
+
+- Each constant documents its preimage variant and whether the address is in the
+  signed bytes.
+- The CAP that defines each arm is cited.
+- The doc comments agree with `preimage.go`, asserted by a test or by citation.
+- No claim is made that any arm is deprecated.
+
+_Implementation guidance_
+
+- The arm-to-preimage mapping is in `preimage.go`; read it rather than restating
+  from the table.
+- Cite CAP-46-11 and CAP-71-01 as appropriate.
+- The legacy address arm is not deprecated — the repository's standards are
+  explicit about that wording.
+
+#### docs: bindings index with the install status of each language
+
+One page listing all six bindings with how to install each, or stating plainly
+that it must be built from source.
+
+**Why this matters:** There are now six bindings in varying states: the wasm
+package is published to npm, the others are not. A reader has to open each
+README to find that out, and the honest answer — that most cannot yet be
+installed from a registry — is not stated anywhere.
+
+**Good first issue.** Entry point: `docs/ and bindings/`.
+
+_Acceptance criteria_
+
+- Every binding is listed with its install method or 'build from source'.
+- Platform support is stated per binding, including that the native bindings are
+  Linux and macOS only.
+- The known macOS limitation in the Node binding is linked rather than restated.
+- A test fails if a new directory appears under `bindings/` without an entry.
+
+_Implementation guidance_
+
+- Be accurate about what is unpublished; overstating availability wastes a
+  reader's afternoon.
+- Link to #518 for the Node macOS issue rather than duplicating its content.
+- The enforcing test keeps the page complete as bindings are added.
+
+#### docs: record the pre-merge supply-chain audit in CONTRIBUTING
+
+Document that `scripts/supply-chain-scan.sh` runs before any merge, how to run
+it locally, and how to read its blocking and warning severities.
+
+**Why this matters:** The scan is a required status check and a standing
+pre-merge step, but `CONTRIBUTING.md` does not mention it. A contributor whose
+pull request is held by a warning has no way to find out what the scan is or how
+to run it themselves.
+
+**Good first issue.** Entry point:
+`CONTRIBUTING.md and scripts/supply-chain-scan.sh`.
+
+_Acceptance criteria_
+
+- The command is documented with how to run it against a pull request and
+  against a working tree.
+- The blocking and warning severities are explained, with what to do about each.
+- It is stated that the exit status must be captured directly, not through a
+  pipe.
+- The documented command is tested as a snippet.
+
+_Implementation guidance_
+
+- The pipe caveat is worth stating: reading `$?` after a pipe gives the wrong
+  command's status, which has caused a real mistake here.
+- Keep it short and point at the script's own header comment for detail.
+- Follow the existing CONTRIBUTING structure rather than adding a new top-level
+  section.
+
+#### docs: glossary entries for threshold and multi-party terms
+
+Glossary entries for threshold signature, FROST, share, DKG, quorum, coordinator
+and participant, as this repository uses them.
+
+**Why this matters:** The glossary covers Soroban authorization vocabulary well.
+The threshold and multi-party features added a second vocabulary with none of it
+defined, and several of those words — quorum in particular — already mean
+something different in `chain.go` than in `frost/`.
+
+**Good first issue.** Entry point: `docs/glossary.md`.
+
+_Acceptance criteria_
+
+- Each term is defined as this repository uses it, with the file that uses it.
+- Where a term has two meanings in the repository, both are given and
+  distinguished.
+- Entries follow the glossary's existing format.
+- Terms link to the relevant package documentation.
+
+_Implementation guidance_
+
+- The quorum ambiguity between `chain.go` and `frost/` is the most useful entry;
+  do not paper over it.
+- Define as used, not as the literature defines it, and note any difference.
+- Match the existing entries' length and tone.
+
+#### docs: document the ci-local manifest's classification vocabulary
+
+Explain the manifest's terms — `requires`, `skip`, `os`, `steps`, `command`,
+`covered`, `bookkeeping` — and the rule that a skip is only for what a laptop
+cannot do.
+
+**Why this matters:** The vocabulary is defined in the manifest's own `note`
+field, which is where a contributor finds it only after a test has already
+failed. Adding a workflow now fails the build until the job is classified, so
+the first encounter is a failure with no documentation to hand.
+
+**Good first issue.** Entry point:
+`scripts/cilocal/manifest.json and CONTRIBUTING.md`.
+
+_Acceptance criteria_
+
+- Each classification term is explained with when to use it.
+- The rule that a skip is not for making a failing check pass is stated.
+- The failure message a contributor sees is shown alongside what to do about it.
+- The `note` field and the documentation cannot disagree, asserted by a test.
+
+_Implementation guidance_
+
+- Reuse the wording from the manifest's `note` rather than paraphrasing it into
+  a second version.
+- Show the actual test failure text; that is what a contributor searches for.
+- The consistency test keeps the two copies honest.
+
+### `area:integrations`
+
+#### feat(integrations): the service's health endpoint reports its version
+
+Include the library and build version in the health response.
+
+**Why this matters:** Diagnosing a deployed service starts with which version is
+running, and the health endpoint does not say. Operators resort to checking the
+image tag, which is the deployment's intent rather than what is actually running
+— and those differ exactly when something has gone wrong.
+
+**Good first issue.** Entry point: `server/handler.go`.
+
+_Acceptance criteria_
+
+- The health response includes the library version and the build commit.
+- The OpenAPI specification is updated and the drift check passes.
+- No configuration, secret or environment detail is exposed alongside it.
+- A test asserts the fields are present and non-empty.
+
+_Implementation guidance_
+
+- Version information is fine to expose; configuration is not — keep the
+  response minimal.
+- The specification drift check will fail if the schema is not updated with it.
+- Reuse the library version work rather than adding another build-time variable.
+
+#### feat(integrations): the GitHub Action reports the version it used
+
+Include the soroauth version in the action's output and job summary.
+
+**Why this matters:** The action's verdict is evidence a reviewer relies on, and
+evidence without a version cannot be reproduced later. When the analyzer's
+findings change between versions, a summary in an old pull request becomes
+unattributable.
+
+**Good first issue.** Entry point: `integrations/action/`.
+
+_Acceptance criteria_
+
+- The version appears in the job summary and as an action output.
+- It identifies the exact build, not just a tag.
+- A test asserts the version appears in the summary.
+- The documentation shows how to pin the action for reproducible results.
+
+_Implementation guidance_
+
+- Report the build identity rather than the action's own ref; those can differ.
+- Reuse the library version work instead of adding a second source.
+- The README should say how to pin, since reproducibility is the point.
+
+### `area:testing`
+
+#### test: assert every golden vector declares the current schema version
+
+A test that fails when a committed vector's `schema_version` is missing or not
+the current one.
+
+**Why this matters:** All eighteen vectors are at version 1 today, and the
+schema is versioned precisely so a change is detectable. Nothing enforces it, so
+a regenerated or hand-added vector at a different version — or with the field
+absent — would be read with the wrong expectations and the mismatch would
+surface as a confusing byte difference.
+
+**Good first issue.** Entry point: `golden_test.go and testdata/vectors/`.
+
+_Acceptance criteria_
+
+- Every vector is checked and a missing or wrong version fails with the file
+  named.
+- The current version is defined in one place, not repeated per test.
+- The test covers any new vector automatically, with no list to maintain.
+- A deliberately altered vector is shown to fail the test, then reverted.
+
+_Implementation guidance_
+
+- Read the directory rather than hard-coding filenames, so new vectors are
+  covered.
+- Show the test failing in the pull request, as the golden-vector gate does,
+  then revert.
+- Never edit a vector to satisfy a test — the standing rule is that vectors are
+  regenerated, not hand-edited.
+
+#### test: assert the CLI's documented exit codes match the implementation
+
+A test comparing the documented exit codes against the ones the CLI actually
+returns.
+
+**Why this matters:** The CLI has meaningful exit codes and they are documented,
+which makes them an interface people script against. A code changed in the
+implementation without the documentation following would silently break a
+caller's error handling, and nothing currently ties the two together.
+
+**Good first issue.** Entry point: `cmd/soroauth/ and docs/`.
+
+_Acceptance criteria_
+
+- Every documented code is produced by a real invocation in the test.
+- A code the CLI returns but does not document fails the test.
+- The documentation is parsed rather than duplicated in the test.
+- The diff subcommand's distinct stale-signature code is covered.
+
+_Implementation guidance_
+
+- Parse the documentation so there is one source of truth, rather than restating
+  the codes in the test.
+- Drive the CLI as a subprocess, so the real exit status is what is observed.
+- Cover both directions: documented-but-unreachable and
+  returned-but-undocumented.
+
+#### test: assert each binding README states its supported platforms
+
+A test requiring every binding's README to state its supported operating
+systems, architectures and runtime versions.
+
+**Why this matters:** The native bindings load a shared library with `dlopen`
+and are Linux and macOS only, which some READMEs say and others do not. A reader
+on Windows should not have to discover that by building, and a new binding
+should not be able to ship without stating it.
+
+**Good first issue.** Entry point: `internal/doccheck/ and bindings/`.
+
+_Acceptance criteria_
+
+- Every directory under `bindings/` must have a README with a platform-support
+  statement.
+- A new binding with no statement fails the build.
+- The check looks for a structured section rather than matching loose prose.
+- The existing READMEs pass, or are updated in the same change.
+
+_Implementation guidance_
+
+- `internal/doccheck` is the right home and already contains tests of this
+  shape.
+- Require a recognisable heading so the check is about structure, not keyword
+  matching.
+- Update the READMEs that currently fail rather than loosening the check.
+
+#### test: assert no workflow uses a mutable action reference
+
+A test that fails when any workflow references an action by tag or branch
+instead of a commit SHA.
+
+**Why this matters:** Pinning actions by SHA is the repository's policy and it
+is currently maintained by hand, which is why two references are still on a tag.
+A mutable reference lets someone else change what runs in CI, and policies kept
+by review rather than by test do not stay complete.
+
+**Good first issue.** Entry point: `internal/doccheck/workflows_test.go`.
+
+_Acceptance criteria_
+
+- Every `uses:` reference is checked for a 40-character SHA.
+- A tag or branch reference fails with the workflow and line named.
+- Local and reusable-workflow references are handled correctly rather than
+  reported as violations.
+- A version comment is required alongside the SHA.
+
+_Implementation guidance_
+
+- `internal/doccheck/workflows_test.go` already parses the workflows — extend it
+  rather than adding another parser.
+- Local `./.github/...` references have no SHA and must not be flagged.
+- Requiring the trailing version comment keeps the pins readable.
+
+#### test: assert every public make target appears in make help
+
+A test that compares `.PHONY` targets against the `help` output and fails on a
+target missing from either.
+
+**Why this matters:** The Makefile is the documented entry point for every
+check, and `help` is how contributors find them. Targets have been added without
+a help line before — the `.PHONY` list and the help text are maintained
+separately, so they drift silently and the newest targets are the least
+discoverable.
+
+**Good first issue.** Entry point: `Makefile`.
+
+_Acceptance criteria_
+
+- Every public `.PHONY` target has a help line.
+- A help line for a target that no longer exists fails the test.
+- Internal targets can be excluded by a documented convention.
+- The test runs as part of `go test ./...`.
+
+_Implementation guidance_
+
+- Parse the Makefile rather than hard-coding the target list.
+- Pick an explicit convention for internal targets instead of inferring from
+  naming.
+- `internal/doccheck` is the natural home, beside the other consistency checks.
+
+### `area:tooling`
+
+#### chore: ignore the Node binding's prebuilds directory
+
+Add `bindings/node/prebuilds/` to `.gitignore`.
+
+**Why this matters:** `git check-ignore` confirms the directory is not ignored,
+so it shows as untracked after any local Node binding build. It appears in
+`git status` for every contributor who builds that binding, which is how an
+unrelated file ends up in a commit — something that has already happened in this
+repository.
+
+**Good first issue.** Entry point: `.gitignore`.
+
+_Acceptance criteria_
+
+- `bindings/node/prebuilds/` is ignored.
+- `git status` is clean after a local Node binding build.
+- No currently tracked file becomes ignored, verified with `git check-ignore`
+  against the tracked set.
+- The entry sits with the other generated-output entries and carries a comment.
+
+_Implementation guidance_
+
+- Check with `git check-ignore -v` before and after; the verification is the
+  work.
+- Make sure nothing in that directory is currently tracked, or ignoring it will
+  hide real changes.
+- The existing generated-output section of `.gitignore` is where this belongs.
+
+#### chore: pin the two remaining mutable action references
+
+Pin `codecov/codecov-action` and the remaining `actions/upload-artifact`
+reference to commit SHAs, as every other action already is.
+
+**Why this matters:** A tag is mutable: whoever controls it can change what runs
+in CI, which has write access to this repository's caches and artifacts. The
+repository already pins actions by SHA as a policy, and a grep shows exactly two
+references still on a tag, so this is a small gap in an otherwise complete
+control.
+
+**Good first issue.** Entry point: `.github/workflows/`.
+
+_Acceptance criteria_
+
+- Both references are pinned to a full 40-character commit SHA with the version
+  in a trailing comment.
+- A grep for mutable references returns nothing.
+- The pinned SHA is verified to be the commit the tag pointed at.
+- A check fails the build if a mutable reference is introduced.
+
+_Implementation guidance_
+
+- Resolve the SHA from the tag and record the version in a comment, matching the
+  existing style.
+- The enforcing check is what stops this recurring; one grep in a workflow is
+  enough.
+- Confirm the SHA belongs to the action's repository, not a fork.
+
+#### chore: a timeout on every CI job
+
+Give every job a `timeout-minutes` and fail the build when a job is added
+without one.
+
+**Why this matters:** Most job blocks across the workflows set no timeout, so
+they inherit the six-hour default. A hung job therefore burns runner minutes for
+hours and blocks the queue — and this project has already hit a genuinely hung
+test process, which is exactly the shape that triggers it.
+
+**Good first issue.** Entry point: `.github/workflows/`.
+
+_Acceptance criteria_
+
+- Every job sets a timeout appropriate to its work.
+- A job added without one fails a check.
+- The e2e and devcontainer jobs keep timeouts long enough for their real
+  runtimes.
+- No job's timeout is below its observed duration on main.
+
+_Implementation guidance_
+
+- Take the durations from recent runs rather than guessing; too tight is worse
+  than the default.
+- `ci-devcontainer.yml` already uses sixty minutes — leave long-running jobs
+  long.
+- The enforcing check belongs with the other workflow meta-checks.
+
+#### chore: a make target for the supply-chain scan
+
+A `make audit` target that runs the supply-chain scan, listed in `make help`.
+
+**Why this matters:** The scan is a required check and a pre-merge step, but
+running it means remembering the script's path and its flags. Every other
+routine check in this repository has a make target, and the one security check
+does not.
+
+**Good first issue.** Entry point: `Makefile and scripts/supply-chain-scan.sh`.
+
+_Acceptance criteria_
+
+- The target runs the scan and propagates its exit status unchanged.
+- It appears in `make help` and in `.PHONY`.
+- The status is not lost through a pipe.
+- The target is documented in CONTRIBUTING alongside the other checks.
+
+_Implementation guidance_
+
+- Do not pipe the script's output in the target, or the make target reports the
+  wrong status.
+- Follow the Makefile's existing comment style for a new target.
+- `make check-index` already lists checks — make sure this appears there too if
+  that target enumerates them.
+
+#### chore: a make target for the mutation suite
+
+A `make mutation` target that runs the mutation module, with a documented time
+bound.
+
+**Why this matters:** `mutation/` is a separate module with no entry point in
+the Makefile, so running it requires reading the module to work out how. A tool
+that is awkward to run does not get run, and mutation testing is the
+repository's own stated strongest correctness signal.
+
+**Good first issue.** Entry point: `Makefile and mutation/`.
+
+_Acceptance criteria_
+
+- The target runs the suite and propagates its exit status.
+- It appears in `make help` and `.PHONY`.
+- The expected runtime is documented in the target's comment.
+- A variable allows scoping the run to one package.
+
+_Implementation guidance_
+
+- Document the runtime honestly; an unexpectedly hour-long target gets cancelled
+  and never retried.
+- Follow the `FUZZTIME` and `SOAKTIME` pattern for the scoping variable.
+- The module is separate, so the target needs the right working directory.
+
+#### chore: issue template for a platform-specific binding failure
+
+A template collecting the platform, architecture, language runtime version,
+binding and build method for a binding problem.
+
+**Why this matters:** There are six bindings across two operating systems and
+two architectures, and a binding report without that context cannot be acted on.
+The existing templates are written for library bugs and do not ask for any of it
+— the macOS Node crash took a long diagnostic session partly because the
+relevant variables were not known up front.
+
+**Good first issue.** Entry point: `.github/ISSUE_TEMPLATE/`.
+
+_Acceptance criteria_
+
+- The template collects operating system, architecture, runtime version, binding
+  and whether a prebuild or source build was used.
+- It asks whether the problem is intermittent, and at what rate.
+- It links to the known-issues section so a known problem is not refiled.
+- It follows the existing templates' structure.
+
+_Implementation guidance_
+
+- The intermittency question matters: #518 fails about one run in five and that
+  rate was the key fact.
+- Keep it short — a long form does not get filled in.
+- Match the existing templates' YAML style.
+
+#### chore: CODEOWNERS entries for the bindings and adapters
+
+Add ownership entries for each binding and adapter directory so changes there
+request a review from whoever maintains them.
+
+**Why this matters:** `CODEOWNERS` exists but predates the bindings and
+adapters, so a change to the JVM binding or a KMS adapter routes to whoever owns
+the root. Those are the areas where a reviewer most needs specific knowledge,
+and a wrongly routed review tends to be a shallow one.
+
+**Good first issue.** Entry point: `.github/CODEOWNERS`.
+
+_Acceptance criteria_
+
+- Each binding and adapter directory has an entry.
+- The entries do not accidentally broaden ownership of the root package.
+- The file's syntax is validated, since a malformed entry silently matches
+  nothing.
+- The pattern order is checked, as later patterns win.
+
+_Implementation guidance_
+
+- Pattern order is the usual mistake: a broad root pattern placed last overrides
+  everything above it.
+- A malformed CODEOWNERS fails quietly — verify through the repository's
+  settings view or an API check.
+- Use teams rather than individuals where a team exists.
