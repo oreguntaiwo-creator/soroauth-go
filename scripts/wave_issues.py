@@ -20,6 +20,7 @@ import argparse
 import collections
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -78,6 +79,16 @@ def render(issue):
     return "\n".join(parts)
 
 
+def wave_name(source):
+    """Derive "Wave N" from a backlog filename.
+
+    The title used to be hard-coded, which silently mislabelled every wave
+    after the first one this script was used for.
+    """
+    m = re.search(r"WAVE(\d+)", os.path.basename(source), re.IGNORECASE)
+    return "Wave %s" % m.group(1) if m else "Issue"
+
+
 def markdown(backlog, source):
     """Render the backlog as a review document.
 
@@ -88,7 +99,7 @@ def markdown(backlog, source):
     total = sum(POINTS[i["complexity"]] for i in backlog)
 
     lines = [
-        "# Wave 10 issue backlog",
+        "# %s issue backlog" % wave_name(source),
         "",
         "<!-- Generated from %s by scripts/wave_issues.py --markdown. Do not edit by hand. -->" % source,
         "",
@@ -101,6 +112,9 @@ def markdown(backlog, source):
     ]
     for level in ("high", "medium", "trivial"):
         n = by_complexity[level]
+        # A wave need not use every tier; an all-zero row is noise in review.
+        if n == 0:
+            continue
         lines.append("| %s | %d | %d | %d |" % (DRIPS_NAME[level], n, POINTS[level], n * POINTS[level]))
     lines += ["| **Total** | **%d** | | **%d** |" % (len(backlog), total), ""]
 
@@ -112,6 +126,8 @@ def markdown(backlog, source):
 
     for level in ("high", "medium", "trivial"):
         group = [i for i in backlog if i["complexity"] == level]
+        if not group:
+            continue
         lines += ["## %s — %d points each (%d issues)" % (DRIPS_NAME[level], POINTS[level], len(group)), ""]
         for area in sorted({i["area"] for i in group}):
             lines += ["### `%s`" % area, ""]
