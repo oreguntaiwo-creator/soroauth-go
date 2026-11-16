@@ -53,6 +53,7 @@ navigation.
 | [FIXTURES](FIXTURES.md)                               | What each e2e fixture contract exercises, and why none is a product.                                      |
 | [ISSUE_BACKLOG](ISSUE_BACKLOG.md)                     | The written-up work that is not done yet; `WAVE9_BACKLOG.json` is the newer Wave's source of truth.       |
 | [WAVE10_BACKLOG](WAVE10_BACKLOG.md)                   | The Wave 10 issue backlog and acceptance criteria.                                                        |
+| [WAVE11_BACKLOG](WAVE11_BACKLOG.md)                   | The Wave 11 issue backlog and acceptance criteria.                                                        |
 | [diagrams](diagrams/README.md)                        | The rendered signing-flow and delegate-tree diagrams, and their committed sources.                        |
 | [UPSTREAM_PROPOSAL](../UPSTREAM_PROPOSAL.md)          | The proposal to add a minimal auth-entry signing helper to `go-stellar-sdk` itself.                       |
 
